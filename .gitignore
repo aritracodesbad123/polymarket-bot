@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.DS_Store
+paper_trade_log.txt
+positions.db
+bot.log
+*.log
+paper_bot.pid
+run_6h.log
+.venv/
