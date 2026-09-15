@@ -54,6 +54,33 @@ GEMINI_MIN_CONFIDENCE = 0.40
 GEMINI_MIN_EXEC_EDGE = 0.01
 
 
+
+def _instrument_label(m) -> str:
+    """Human ticker-ish label for console: BTC / ETH / EURUSD / XAU ..."""
+    blob = f"{getattr(m, 'question', '')} {getattr(m, 'category', '')}".lower()
+    rules = (
+        ("BTC", ("bitcoin", "btc")),
+        ("ETH", ("ethereum", "ether", " eth")),
+        ("SOL", ("solana", " sol")),
+        ("XAU", ("xauusd", "xau", "gold")),
+        ("XAG", ("xagusd", "xag", "silver")),
+        ("EURUSD", ("eurusd", "eur/usd", "eur usd")),
+        ("GBPUSD", ("gbpusd", "gbp/usd")),
+        ("USDJPY", ("usdjpy", "usd/jpy")),
+        ("DXY", ("dxy", "dollar index", "us dollar index")),
+        ("USDARS", ("usd to ars", "ars", "argentina")),
+    )
+    for label, keys in rules:
+        if any(k.strip() in blob for k in keys):
+            return label
+    cat = (getattr(m, "category", "") or "").strip()
+    if cat and cat.lower() not in ("other", ""):
+        return cat.upper()[:16]
+    # last resort: first 24 chars of question
+    q = (getattr(m, "question", "") or "").strip()
+    return (q[:24] + "…") if len(q) > 24 else (q or "UNKNOWN")
+
+
 def _spread_bucket(spread: float) -> str:
     """Bucket rejected spreads for console/KPI (cents on a 0-1 book)."""
     c = spread * 100.0
@@ -420,8 +447,10 @@ class TradingApp:
                 open_positions=len(positions),
                 **gemini_kw,
             )
+            ident = self._market_identity(m)
             gates_out = decision.gates_dict()
             gates_out["ai_provider"] = {"passed": True, "detail": self._provider_tag()}
+            gates_out["market"] = {"passed": True, "detail": f"{ident['instrument']} | {ident['question'][:80]}", **ident}
             did = self.repo.insert_decision(
                 {
                     "market_id": m.market_id,
@@ -445,7 +474,13 @@ class TradingApp:
             )
             if not decision.approved:
                 self.cycle_stats["rejected"] += 1
-                self.repo.event("TRADE_REJECTED", decision.reject_reason or "", {"market_id": m.market_id})
+                self.log.info(
+                    "REJECT instrument=%s reason=%s %s",
+                    ident["instrument"],
+                    decision.reject_reason,
+                    ident["question"][:80],
+                )
+                self.repo.event("TRADE_REJECTED", decision.reject_reason or "", ident)
                 continue
             self.repo.event("OPPORTUNITY", m.question[:120], {"edge": decision.raw_edge})
             err = await self.executor.execute(decision, did)
@@ -455,15 +490,28 @@ class TradingApp:
             break  # one token per market per cycle
         return True
 
+
+    def _market_identity(self, m) -> dict:
+        inst = _instrument_label(m)
+        q = (m.question or "")[:120]
+        return {
+            "instrument": inst,
+            "question": q,
+            "category": m.category or "",
+            "market_id": m.market_id,
+        }
+
     def _reject(self, m, reason: str, extra: dict | None = None) -> None:
         self.cycle_stats["rejected"] += 1
         extra = dict(extra or {})
         detail = ""
         if reason == "spread_too_wide" and extra.get("spread") is not None:
             detail = f"spread={float(extra['spread']):.4f} max={float(extra.get('max_spread', self.settings.max_spread)):.4f}"
+        ident = self._market_identity(m)
         gates = {
             reason: {"passed": False, "detail": detail},
             "ai_provider": {"passed": True, "detail": self._provider_tag()},
+            "market": {"passed": True, "detail": f"{ident['instrument']} | {ident['question'][:80]}", **ident},
         }
         if reason == "spread_too_wide" and extra.get("spread") is not None:
             gates["spread_width"] = {
@@ -475,7 +523,7 @@ class TradingApp:
                 "best_ask": extra.get("best_ask"),
                 "bucket": _spread_bucket(float(extra["spread"])),
             }
-        payload = {"market_id": m.market_id, **extra}
+        payload = {**ident, **extra}
         if "spread" in extra:
             payload["spread_bucket"] = _spread_bucket(float(extra["spread"]))
         self.repo.insert_decision(
@@ -487,6 +535,12 @@ class TradingApp:
                 "strategy_version": self.settings.strategy_version,
                 "prompt_version": self.settings.prompt_version,
             }
+        )
+        self.log.info(
+            "REJECT instrument=%s reason=%s %s",
+            ident["instrument"],
+            reason,
+            ident["question"][:80],
         )
         self.repo.event("TRADE_REJECTED", reason, payload)
 
