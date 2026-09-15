@@ -57,6 +57,7 @@ class ProbabilityEngine:
                 raise InvalidEstimate(f"grok_error:{exc}") from exc
         if self.provider == "gemini" and self.gemini is not None:
             try:
+                # Always run extreme-p abstain via _finish for Gemini too.
                 return self._finish(
                     await self.gemini.estimate(self.prompts.body, user_block), packet
                 )
@@ -86,6 +87,5 @@ class ProbabilityEngine:
         p = est.estimated_probability
         if p < self.EXTREME_P or p > (1.0 - self.EXTREME_P):
             est.should_abstain = True
-            if not est.abstention_reason:
-                est.abstention_reason = f"extreme_probability:{p:.4f}"
+            est.abstention_reason = f"extreme_probability:{p:.4f}"
         return est

@@ -156,6 +156,10 @@ class StrategyEvaluator:
             return _fail(gates, "low_confidence", **base, grok_p=estimate.estimated_probability)
 
         p_yes = estimate.estimated_probability
+        # Defense-in-depth: never trade near-0/1 even if abstain flag was missed upstream.
+        if p_yes < 0.02 or p_yes > 0.98:
+            g("probability_not_extreme", False, f"p_yes={p_yes:.4f}")
+            return _fail(gates, "extreme_probability", **base, grok_p=p_yes)
         yes_ask = book.best_ask
         # NO book is not this book; we only have the YES token book here.
         # Caller should pass the book for the token being considered.

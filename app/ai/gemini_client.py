@@ -226,8 +226,15 @@ class GeminiClient:
             return est
         # Only cool down after we actually got HTTP 200s that still wouldn't parse,
         # or after auth death. Don't cool down solely on 404 model-name misses.
-        if saw_success_http or (last_exc and "401" in str(last_exc) or "403" in str(last_exc)):
+        # Auth death or successful-but-unusable responses → full cooldown.
+        # Pure 429/timeout exhaustion → shorter cool so we retry sooner under quota pressure.
+        msg = repr(last_exc)
+        if last_exc and ("401" in msg or "403" in msg):
             self._cool_until = time.time() + COOLDOWN_SECONDS
+        elif saw_success_http:
+            self._cool_until = time.time() + COOLDOWN_SECONDS
+        elif last_exc and ("429" in msg or "timeout" in msg.lower() or "Timeout" in msg):
+            self._cool_until = time.time() + min(30.0, COOLDOWN_SECONDS)
         raise RuntimeError(f"gemini_cascade_exhausted:{last_exc}")
 
     async def _do_post(
