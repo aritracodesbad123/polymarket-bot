@@ -470,6 +470,11 @@ def provider_from_gates(gates_json: str | None) -> str | None:
 
 @app.get("/api/snapshot")
 def snapshot() -> JSONResponse:
+    return JSONResponse(build_snapshot())
+
+
+def build_snapshot() -> dict[str, Any]:
+    """Full ops payload — used by FastAPI and Streamlit."""
     t0 = time.time()
     agent = agent_status()
     tip = tip_commit()
@@ -486,7 +491,7 @@ def snapshot() -> JSONResponse:
 
     if not DB_PATH.exists():
         payload["error"] = f"DB missing: {DB_PATH}"
-        return JSONResponse(payload)
+        return payload
 
     fills_rows = []
     with connect() as con:
@@ -922,7 +927,7 @@ def snapshot() -> JSONResponse:
             "query_ms": round((time.time() - t0) * 1000, 1),
         }
     )
-    return JSONResponse(payload)
+    return payload
 
 
 def _has_positions_cols(con: sqlite3.Connection) -> bool:
