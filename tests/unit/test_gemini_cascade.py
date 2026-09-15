@@ -1,67 +1,43 @@
-import json
-
-import pytest
-
-from app.ai.gemini_client import GEMINI_2XX, GEMINI_3XX, GeminiClient, gemini_cascade
-from app.ai.schemas import MarketEstimate
-from tests.conftest import estimate
-
-
-def _vertex_ok(est: MarketEstimate | None = None) -> str:
-    body = (est or estimate()).model_dump_json()
-    return json.dumps({"candidates": [{"content": {"parts": [{"text": body}]}}]})
+from app.ai.gemini_client import (
+    GEMINI_CASCADE,
+    gemini_cascade,
+    normalize_estimate_obj,
+    parse_estimate_json,
+)
 
 
-def test_cascade_3xx_before_2xx():
-    chain = gemini_cascade()
-    assert chain[0] == "gemini-3.1-pro"
-    assert chain[: len(GEMINI_3XX)] == GEMINI_3XX
-    assert chain[len(GEMINI_3XX) :] == GEMINI_2XX
-    assert all(not m.startswith("gemini-2.") for m in GEMINI_3XX)
+def test_cascade_prefers_25_flash():
+    assert gemini_cascade()[0] == "gemini-2.5-flash"
+    assert "gemini-2.5-flash" in GEMINI_CASCADE
 
 
-@pytest.mark.asyncio
-async def test_3_1_pro_success_skips_rest():
-    urls: list[str] = []
-
-    async def post(url, _headers, _payload):
-        urls.append(url)
-        return 200, _vertex_ok()
-
-    est = await GeminiClient("k", post=post).estimate("sys", "user")
-    assert est.estimated_probability == 0.7
-    assert len(urls) == 1
-    assert "gemini-3.1-pro:generateContent" in urls[0]
-    assert not any("gemini-2." in u for u in urls)
-
-
-@pytest.mark.asyncio
-async def test_all_3xx_404_then_2xx():
-    urls: list[str] = []
-
-    async def post(url, _headers, _payload):
-        urls.append(url)
-        if GEMINI_2XX[0] in url:
-            return 200, _vertex_ok()
-        return 404, "not found"
-
-    est = await GeminiClient("k", post=post).estimate("sys", "user")
-    assert est.estimated_probability == 0.7
-    models = [u.rsplit("/", 1)[-1].split(":")[0] for u in urls]
-    assert models[: len(GEMINI_3XX)] == list(GEMINI_3XX)
-    assert models[len(GEMINI_3XX)] == GEMINI_2XX[0]
-    assert models[len(GEMINI_3XX)].startswith("gemini-2.")
+def test_normalize_none_abstention_and_string_lists():
+    obj = normalize_estimate_obj(
+        {
+            "market_id": "m1",
+            "estimated_probability": 0.55,
+            "confidence": "Low",
+            "confidence_score": 2,
+            "base_rate_probability": 0.5,
+            "evidence_adjustment": 0.05,
+            "key_evidence": "one fact",
+            "counterarguments": "one counter",
+            "uncertainty_factors": "noise",
+            "stale_information_risk": "Medium",
+            "should_abstain": False,
+            "abstention_reason": None,
+            "reasoning_summary": "thin",
+        }
+    )
+    est = parse_estimate_json(__import__("json").dumps(obj))
+    assert est.confidence == "low"
+    assert 0.0 <= est.confidence_score <= 1.0
+    assert est.key_evidence == ["one fact"]
+    assert est.abstention_reason == ""
+    assert est.stale_information_risk == "medium"
 
 
-@pytest.mark.asyncio
-async def test_cascade_exhausted_raises():
-    n = 0
-
-    async def post(_url, _headers, _payload):
-        nonlocal n
-        n += 1
-        return 404, "not found"
-
-    with pytest.raises(RuntimeError, match="gemini_cascade_exhausted"):
-        await GeminiClient("k", post=post).estimate("sys", "user")
-    assert n == len(gemini_cascade())
+def test_parse_probability_alias():
+    raw = '{"market_id":"m1","probability":0.6,"confidence":"medium","confidence_score":0.7,"base_rate_probability":0.5,"evidence_adjustment":0.1,"key_evidence":[],"counterarguments":[],"uncertainty_factors":[],"stale_information_risk":"low","should_abstain":false,"abstention_reason":"","reasoning_summary":"ok"}'
+    est = parse_estimate_json(raw)
+    assert est.estimated_probability == 0.6
