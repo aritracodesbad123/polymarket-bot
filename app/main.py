@@ -48,6 +48,9 @@ MODE: HALTED
 """.strip()
 
 GEMINI_EDGE_TIGHTEN = 0.02
+GEMINI_KELLY_MULTIPLIER = 0.125
+GEMINI_MIN_CONFIDENCE = 0.50
+GEMINI_MIN_EXEC_EDGE = 0.02  # fee-aware floor while on Gemini
 
 
 def banner_for(settings: Settings, repo: Repositories) -> str:
@@ -213,6 +216,25 @@ class TradingApp:
             return True
         return bool(self.engine and self.engine.provider == "gemini")
 
+    def _provider_tag(self) -> str:
+        if not self.engine:
+            return "none"
+        prov = self.engine.provider or "none"
+        model = self.engine.last_model or ""
+        return f"{prov}:{model}" if model else prov
+
+    def _gemini_strategy_kwargs(self) -> dict:
+        """Stricter gates while on Gemini; human reset when back on Grok."""
+        if not (self.engine and self.engine.provider == "gemini"):
+            return {}
+        return {
+            "min_edge": self.settings.min_edge + GEMINI_EDGE_TIGHTEN,
+            "kelly_multiplier": GEMINI_KELLY_MULTIPLIER,
+            "min_confidence_score": GEMINI_MIN_CONFIDENCE,
+            "min_exec_edge": GEMINI_MIN_EXEC_EDGE,
+        }
+
+
     async def _consider(self, m, positions, marks: dict[str, float]) -> bool:
         if not m.yes_token_id:
             return False
@@ -292,7 +314,7 @@ class TradingApp:
             {
                 "market_id": m.market_id,
                 "prompt_version": self.settings.prompt_version,
-                "model": self.engine.last_model or self.settings.grok_model,
+                "model": self._provider_tag(),
                 "estimated_probability": est.estimated_probability,
                 "confidence": est.confidence,
                 "confidence_score": est.confidence_score,
@@ -310,9 +332,7 @@ class TradingApp:
         self._mark_books(m, yes_book, no_book, marks)
         exp = exposure_from_positions(positions, marks)
         canary = self.live.authorize_now().allowed
-        edge_floor = self.settings.min_edge
-        if self.engine.provider == "gemini":
-            edge_floor += GEMINI_EDGE_TIGHTEN
+        gemini_kw = self._gemini_strategy_kwargs()
         for book in (yes_book, no_book):
             if book is None:
                 continue
@@ -346,8 +366,10 @@ class TradingApp:
                 data_fresh=True,
                 canary=canary,
                 open_positions=len(positions),
-                min_edge=edge_floor,
+                **gemini_kw,
             )
+            gates_out = decision.gates_dict()
+            gates_out["ai_provider"] = {"passed": True, "detail": self._provider_tag()}
             did = self.repo.insert_decision(
                 {
                     "market_id": m.market_id,
@@ -355,7 +377,7 @@ class TradingApp:
                     "side": decision.side,
                     "approved": decision.approved,
                     "reject_reason": decision.reject_reason,
-                    "gates": decision.gates_dict(),
+                    "gates": gates_out,
                     "grok_p": decision.grok_p,
                     "market_price": decision.market_price,
                     "raw_edge": decision.raw_edge,
@@ -383,12 +405,13 @@ class TradingApp:
 
     def _reject(self, m, reason: str) -> None:
         self.cycle_stats["rejected"] += 1
+        gates = {reason: {"passed": False, "detail": ""}, "ai_provider": {"passed": True, "detail": self._provider_tag()}}
         self.repo.insert_decision(
             {
                 "market_id": m.market_id,
                 "approved": False,
                 "reject_reason": reason,
-                "gates": {reason: {"passed": False, "detail": ""}},
+                "gates": gates,
                 "strategy_version": self.settings.strategy_version,
                 "prompt_version": self.settings.prompt_version,
             }

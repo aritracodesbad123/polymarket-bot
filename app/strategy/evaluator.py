@@ -117,9 +117,15 @@ class StrategyEvaluator:
         open_positions: int = 0,
         canary_day_notional: float = 0.0,
         min_edge: float | None = None,
+        kelly_multiplier: float | None = None,
+        min_confidence_score: float | None = None,
+        min_exec_edge: float | None = None,
     ) -> Decision:
         s = self.settings
         edge_floor = s.min_edge if min_edge is None else min_edge
+        kelly_mult = s.kelly_multiplier if kelly_multiplier is None else kelly_multiplier
+        conf_floor = s.min_confidence_score if min_confidence_score is None else min_confidence_score
+        exec_edge_floor = 0.0 if min_exec_edge is None else min_exec_edge
         gates: list[Gate] = []
         base = dict(market_id=market.market_id, category=market.category, correlation_group=market.correlation_group)
 
@@ -146,7 +152,7 @@ class StrategyEvaluator:
         assert estimate is not None
         if not g("grok_not_abstain", not estimate.should_abstain, estimate.abstention_reason):
             return _fail(gates, "grok_abstain", **base, grok_p=estimate.estimated_probability)
-        if not g("confidence_sufficient", estimate.confidence_score >= s.min_confidence_score, str(estimate.confidence_score)):
+        if not g("confidence_sufficient", estimate.confidence_score >= conf_floor, f"{estimate.confidence_score} floor={conf_floor}"):
             return _fail(gates, "low_confidence", **base, grok_p=estimate.estimated_probability)
 
         p_yes = estimate.estimated_probability
@@ -176,7 +182,7 @@ class StrategyEvaluator:
         if not g("expected_value_positive", ev > 0, f"ev={ev:.4f}"):
             return _fail(gates, "nonpositive_ev", **base, grok_p=p, market_price=px, raw_edge=raw_edge)
 
-        kelly_f = quarter_kelly(p, px, s.kelly_multiplier)
+        kelly_f = quarter_kelly(p, px, kelly_mult)
         if not g("kelly_positive", kelly_f > 0, f"kelly={kelly_f:.4f}"):
             return _fail(gates, "kelly_zero", **base, grok_p=p, market_price=px, raw_edge=raw_edge, kelly=kelly_f)
 
@@ -224,13 +230,13 @@ class StrategyEvaluator:
         exec_edge = p - exec_px - fee
         slip_ok = fill.slippage_pct <= s.max_slippage_pct
         g("slippage_acceptable", slip_ok, f"slip={fill.slippage_pct:.4f}")
-        g("execution_adjusted_edge_positive", exec_edge > 0, f"exec_edge={exec_edge:.4f}")
+        g("execution_adjusted_edge_positive", exec_edge > exec_edge_floor, f"exec_edge={exec_edge:.4f} floor={exec_edge_floor:.4f}")
         g("balance_sufficient", cash >= fill.notional if fill.filled_shares else False, f"cash={cash:.2f}")
 
         if not slip_ok:
             return _fail(gates, "slippage_too_high", **base, grok_p=p, market_price=px, raw_edge=raw_edge, execution_adjusted_edge=exec_edge, kelly=kelly_f, fill=fill, token_id=token_id, side=side)
-        if exec_edge <= 0:
-            return _fail(gates, "execution_edge_nonpositive", **base, grok_p=p, market_price=px, raw_edge=raw_edge, execution_adjusted_edge=exec_edge, kelly=kelly_f, fill=fill, token_id=token_id, side=side)
+        if exec_edge <= exec_edge_floor:
+            return _fail(gates, "execution_edge_too_small" if exec_edge_floor > 0 else "execution_edge_nonpositive", **base, grok_p=p, market_price=px, raw_edge=raw_edge, execution_adjusted_edge=exec_edge, kelly=kelly_f, fill=fill, token_id=token_id, side=side)
         if not fill.filled_shares:
             return _fail(gates, "no_fill_estimate", **base, grok_p=p, market_price=px, fill=fill, token_id=token_id, side=side)
 
