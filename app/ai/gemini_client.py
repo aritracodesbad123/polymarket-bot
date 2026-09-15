@@ -13,15 +13,17 @@ from app.ai.schemas import MarketEstimate
 
 log = logging.getLogger(__name__)
 
-VERTEX = "https://aiplatform.googleapis.com/v1/publishers/google/models"
+VERTEX = "https://aiplatform.googleapis.com/v1/publishers/google/models"  # Vertex only; not generativelanguage.googleapis.com
 COOLDOWN_SECONDS = 90.0
 
 # Prefer models that actually resolve on Vertex with this API key.
 # Skip fantasy 3.1-pro ids that 404 and burn the cascade into cooldown.
+# Vertex publisher API (x-goog-api-key) — NOT AI Studio / generativelanguage.
+# Prefer gemini-3.6-flash first (confirmed working on this Vertex key).
 GEMINI_CASCADE = (
+    "gemini-3.6-flash",
     "gemini-2.5-flash",
     "gemini-2.5-pro",
-    "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.8-flash",
     "gemini-3.5-flash-lite",

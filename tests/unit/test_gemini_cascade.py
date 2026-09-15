@@ -7,8 +7,8 @@ from app.ai.gemini_client import (
 
 
 def test_cascade_prefers_25_flash():
-    assert gemini_cascade()[0] == "gemini-2.5-flash"
-    assert "gemini-2.5-flash" in GEMINI_CASCADE
+    assert gemini_cascade()[0] == "gemini-3.6-flash"
+    assert "gemini-3.6-flash" in GEMINI_CASCADE
 
 
 def test_normalize_none_abstention_and_string_lists():
