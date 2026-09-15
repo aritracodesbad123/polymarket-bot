@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -168,8 +169,13 @@ class GeminiClient:
         self.last_model = GEMINI_CASCADE[0]
         self._cool_until = 0.0
         self._post = post
+        self._lock = asyncio.Lock()  # serialize calls — concurrent hammer → blank httpx fails + cooldown
 
     async def estimate(self, system_prompt: str, user_prompt: str) -> MarketEstimate:
+        async with self._lock:
+            return await self._estimate_unlocked(system_prompt, user_prompt)
+
+    async def _estimate_unlocked(self, system_prompt: str, user_prompt: str) -> MarketEstimate:
         if time.time() < self._cool_until:
             raise RuntimeError("gemini_cooldown")
         system = f"{system_prompt.rstrip()}\n\n{SCHEMA_HINT}"
@@ -192,19 +198,19 @@ class GeminiClient:
                 status, body = await self._do_post(url, headers, payload)
             except Exception as exc:
                 last_exc = exc
-                log.warning("gemini %s failed: %s — next", model, exc)
+                log.warning("gemini %s failed: %r — next", model, exc)
                 continue
             if status in (401, 403):
                 last_exc = RuntimeError(f"gemini HTTP {status}")
-                log.warning("gemini %s HTTP %s — abort cascade", model, status)
+                log.warning("gemini %s HTTP %s body_head=%r — abort cascade", model, status, (body or "")[:240])
                 break
             if status == 404:
                 last_exc = RuntimeError(f"gemini HTTP 404")
-                log.warning("gemini %s HTTP 404 — next", model)
+                log.warning("gemini %s HTTP 404 body_head=%r — next", model, (body or "")[:240])
                 continue
             if status >= 400:
                 last_exc = RuntimeError(f"gemini HTTP {status}")
-                log.warning("gemini %s HTTP %s — next", model, status)
+                log.warning("gemini %s HTTP %s body_head=%r — next", model, status, (body or "")[:240])
                 continue
             saw_success_http = True
             try:
@@ -212,7 +218,7 @@ class GeminiClient:
                 est = parse_estimate_json(_candidate_text(data) or body)
             except (json.JSONDecodeError, ValidationError, ValueError) as exc:
                 last_exc = exc
-                log.warning("gemini %s parse miss: %s — next", model, exc)
+                log.warning("gemini %s parse miss: %r body_head=%r — next", model, exc, (body or "")[:240])
                 continue
             self.last_model = model
             if model != GEMINI_CASCADE[0]:
@@ -231,6 +237,6 @@ class GeminiClient:
             return await self._post(url, headers, payload)
         import httpx
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(url, headers=headers, json=payload)
             return r.status_code, r.text
