@@ -51,6 +51,85 @@ def cmd_opportunities(app: TradingApp) -> int:
     return 0
 
 
+
+async def cmd_open_marks(app: TradingApp) -> int:
+    """Live mids for open DB positions — for console Mark/equity poll."""
+    import json
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from app.main import _instrument_label
+
+    rows = app.repo.positions()
+    snaps = app.db.query(
+        "SELECT * FROM portfolio_snapshots ORDER BY id DESC LIMIT 1"
+    )
+    if snaps:
+        row = snaps[0]
+        keys = set(row.keys())
+        cash = float(row["cash"] if "cash" in keys else row["cash_usd"] if "cash_usd" in keys else app.settings.paper_starting_bankroll)
+        reserved = float(row["reserved_cash"] if "reserved_cash" in keys and row["reserved_cash"] is not None else (row["reserved"] if "reserved" in keys and row["reserved"] is not None else 0))
+    else:
+        cash = float(app.settings.paper_starting_bankroll)
+        reserved = 0.0
+
+    out = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "cash": cash,
+        "reserved": reserved,
+        "start_bankroll": float(app.settings.paper_starting_bankroll),
+        "positions": [],
+    }
+    inv = 0.0
+    for r in rows:
+        token_id = r["token_id"]
+        market_id = r["market_id"]
+        shares = float(r["shares"])
+        entry = float(r["avg_price"])
+        mid = bid = ask = None
+        try:
+            book = await app.data.get_order_book(token_id, market_id)
+            bid = book.best_bid
+            ask = book.best_ask
+            mid = book.midpoint
+            if mid is None and bid is not None and ask is not None:
+                mid = (bid + ask) / 2.0
+            if mid is None:
+                mid = ask or bid or entry
+        except Exception as exc:
+            mid = entry
+            out.setdefault("errors", []).append({"token_id": token_id, "error": str(exc)})
+        mark = float(mid)
+        inv += shares * mark
+        mq = app.db.query_one(
+            "SELECT question, category FROM markets WHERE market_id=?", (market_id,)
+        )
+        question = (mq["question"] if mq else "") or ""
+        category = (mq["category"] if mq else "") or ""
+        inst = _instrument_label(SimpleNamespace(question=question, category=category))
+        out["positions"].append(
+            {
+                "token_id": token_id,
+                "market_id": market_id,
+                "instrument": inst,
+                "question": question[:120],
+                "category": category,
+                "shares": shares,
+                "entry": entry,
+                "mark": mark,
+                "bid": bid,
+                "ask": ask,
+                "unrealized": (mark - entry) * shares,
+                "notional": shares * mark,
+            }
+        )
+    out["inventory"] = inv
+    out["equity"] = cash + reserved + inv
+    out["unrealized"] = out["equity"] - float(app.settings.paper_starting_bankroll)
+    print(json.dumps(out, indent=2, default=str))
+    return 0
+
+
 def cmd_positions(app: TradingApp) -> int:
     for p in app.paper._positions.values():
         print(f"{p.token_id[:16]} shares={p.shares:.4f} avg={p.avg_price:.4f} {p.market_id}")
@@ -169,6 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("markets")
     sub.add_parser("opportunities")
     sub.add_parser("positions")
+    sub.add_parser("open-marks")
     sub.add_parser("orders")
     sub.add_parser("daily-report")
     sub.add_parser("calibration-report")
@@ -195,6 +275,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_opportunities(app)
     if args.cmd == "positions":
         return cmd_positions(app)
+    if args.cmd == "open-marks":
+        return asyncio.run(cmd_open_marks(app))
     if args.cmd == "orders":
         return cmd_orders(app)
     if args.cmd == "daily-report":
