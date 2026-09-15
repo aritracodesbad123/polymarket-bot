@@ -18,13 +18,13 @@ VERTEX = "https://aiplatform.googleapis.com/v1/publishers/google/models"  # Vert
 COOLDOWN_SECONDS = 90.0
 
 # Vertex publisher API (x-goog-api-key) — NOT AI Studio / generativelanguage.
-# Prefer gemini-3.6-flash when healthy; on HTTP 429 fall through the rest of the cascade
-# in the SAME call (2.5-flash next). Sticky skip keeps a hot 429 model out of the first
+# Prefer gemini-2.5-flash under Vertex 429 pressure; still try 3.6-flash later in the cascade.
+# HTTP 429 falls through in the SAME call; sticky-skip keeps hot models out of the first slot. Sticky skip keeps a hot 429 model out of the first
 # slot for a short window so we don't re-burn it every estimate.
 GEMINI_CASCADE = (
-    "gemini-3.6-flash",
     "gemini-2.5-flash",
     "gemini-2.5-pro",
+    "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
