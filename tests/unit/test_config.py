@@ -18,3 +18,10 @@ def test_defaults():
     assert s.kelly_multiplier == 0.25
     assert s.live_trading_enabled is False
     assert s.trading_mode == "paper"
+
+
+def test_gemini_key_stripped(monkeypatch, tmp_path):
+    monkeypatch.setenv("GEMINI_API_KEY", "secret-gemini")
+    s = Settings.from_env(dotenv_path=tmp_path / "none.env")
+    assert s.gemini_api_key == "secret-gemini"
+    assert "secret-gemini" not in str(s.public_dict())

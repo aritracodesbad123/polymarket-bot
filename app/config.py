@@ -44,6 +44,7 @@ class Settings(BaseModel):
 
     xai_api_key: str | None = None
     grok_model: str = "grok-4.6"
+    gemini_api_key: str | None = None
 
     polymarket_api_url: str = "https://clob.polymarket.com"
     polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
@@ -101,12 +102,14 @@ class Settings(BaseModel):
             x.strip() for x in _s("CATEGORY_BLACKLIST", "").split(",") if x.strip()
         )
         xai = os.environ.get("XAI_API_KEY") or None
+        gemini = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or None
         tg_token = os.environ.get("TELEGRAM_BOT_TOKEN") or None
         tg_chat = os.environ.get("TELEGRAM_CHAT_ID") or None
         return cls(
             trading_mode=trading_mode,
             live_trading_enabled=_b("LIVE_TRADING_ENABLED", False),
             xai_api_key=xai,
+            gemini_api_key=gemini,
             grok_model=_s("GROK_MODEL", "grok-4.6"),
             polymarket_api_url=_s("POLYMARKET_API_URL", "https://clob.polymarket.com"),
             polymarket_gamma_url=_s(
@@ -156,6 +159,7 @@ class Settings(BaseModel):
     def public_dict(self) -> dict:
         d = self.model_dump()
         d.pop("xai_api_key", None)
+        d.pop("gemini_api_key", None)
         d.pop("telegram_bot_token", None)
         return d
 

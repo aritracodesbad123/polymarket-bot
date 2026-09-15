@@ -21,6 +21,11 @@ def test_stale_book():
     assert filter_book(book(age_s=30), s) == "stale_data"
 
 
+def test_fresh_book():
+    s = Settings(max_data_age_seconds=15)
+    assert filter_book(book(age_s=0), s) is None
+
+
 def test_wide_spread():
     s = Settings(max_spread=0.02)
     assert filter_book(book(ask=0.6, bid=0.4), s) == "spread_too_wide"

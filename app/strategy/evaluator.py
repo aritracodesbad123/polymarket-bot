@@ -116,8 +116,10 @@ class StrategyEvaluator:
         canary: bool = False,
         open_positions: int = 0,
         canary_day_notional: float = 0.0,
+        min_edge: float | None = None,
     ) -> Decision:
         s = self.settings
+        edge_floor = s.min_edge if min_edge is None else min_edge
         gates: list[Gate] = []
         base = dict(market_id=market.market_id, category=market.category, correlation_group=market.correlation_group)
 
@@ -167,7 +169,7 @@ class StrategyEvaluator:
         if px is None:
             return _fail(gates, "no_executable_price", **base)
         raw_edge = p - px
-        if not g("edge_sufficient", raw_edge >= s.min_edge, f"raw_edge={raw_edge:.4f}"):
+        if not g("edge_sufficient", raw_edge >= edge_floor, f"raw_edge={raw_edge:.4f} floor={edge_floor:.4f}"):
             return _fail(gates, "edge_too_small", **base, grok_p=p, market_price=px, raw_edge=raw_edge)
 
         ev = expected_profit_per_share(p, px)

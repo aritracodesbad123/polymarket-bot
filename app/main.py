@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from app.ai.probability_engine import InvalidEstimate, ProbabilityEngine
 from app.ai.prompt_manager import PromptManager
 from app.ai.grok_client import GrokClient
+from app.ai.gemini_client import GeminiClient
+from app.ai.credits import CreditHardFail
 from app.broker.live import LiveBroker
 from app.broker.paper import PaperBroker
 from app.config import Settings
@@ -44,6 +46,8 @@ POLYGROK TRADING BOT
 MODE: HALTED
 ========================================
 """.strip()
+
+GEMINI_EDGE_TIGHTEN = 0.02
 
 
 def banner_for(settings: Settings, repo: Repositories) -> str:
@@ -85,16 +89,26 @@ class TradingApp:
             "partials": 0,
             "ai_errors": 0,
         }
-        if settings.xai_api_key:
-            self.research = XAISearchProvider(settings.xai_api_key, settings.grok_model)
+        self._pending_ai_provider_notice: str | None = None
+        grok = (
+            GrokClient(settings.xai_api_key, settings.grok_model)
+            if settings.xai_api_key
+            else None
+        )
+        gemini = GeminiClient(settings.gemini_api_key) if settings.gemini_api_key else None
+        if grok or gemini:
             self.engine: ProbabilityEngine | None = ProbabilityEngine(
-                GrokClient(settings.xai_api_key, settings.grok_model),
+                grok,
                 PromptManager(settings.prompt_version),
-                settings.grok_model,
+                gemini,
+                on_provider_swap=self._on_provider_swap,
             )
         else:
-            self.research = NullResearchProvider()
             self.engine = None
+        if grok is not None:
+            self.research = XAISearchProvider(settings.xai_api_key, settings.grok_model)
+        else:
+            self.research = NullResearchProvider()
 
     async def start_clock(self) -> None:
         self.repo.mark_paper_started()
@@ -111,6 +125,11 @@ class TradingApp:
             await self.telegram.send(text)
         except Exception:
             self.repo.event("API_ERROR", "telegram")
+
+    def _on_provider_swap(self, model: str) -> None:
+        msg = f"AI_PROVIDER gemini:vertex model={model} (xAI credits exhausted)"
+        self._pending_ai_provider_notice = msg
+        self.repo.event("AI_PROVIDER", msg)
 
     async def cycle(self) -> None:
         st = self.repo.state()
@@ -157,33 +176,53 @@ class TradingApp:
                 break
             if self.repo.state().halted:
                 break
-            await self._consider(m, positions, marks)
-            grok_calls += 1 if self.engine else 0
+            used = await self._consider(m, positions, marks)
+            if used:
+                grok_calls += 1
+            gemini_ready = bool(self.engine and self.engine.gemini)
+            grok_dead = bool(
+                getattr(self.research, "blocked", False)
+                or (self.engine and self.engine.grok and self.engine.grok.blocked)
+            )
+            if grok_dead and not gemini_ready:
+                break
         self.portfolio.snapshot(marks)
         mismatch = await self.paper.reconcile()
         if mismatch:
             self.risk.note_recon_mismatch(mismatch)
 
-    async def _consider(self, m, positions, marks: dict[str, float]) -> None:
-        if not m.yes_token_id:
-            return
-        try:
-            yes_book = await self.data.get_order_book(m.yes_token_id, m.market_id)
-            no_book = (
-                await self.data.get_order_book(m.no_token_id, m.market_id)
-                if m.no_token_id
-                else None
-            )
-        except Exception as exc:
-            self.risk.note_api_failure()
-            self.repo.event("API_ERROR", str(exc))
-            return
+    async def _books(self, m):
+        yes_book = await self.data.get_order_book(m.yes_token_id, m.market_id)
+        no_book = (
+            await self.data.get_order_book(m.no_token_id, m.market_id)
+            if m.no_token_id
+            else None
+        )
+        return yes_book, no_book
+
+    def _mark_books(self, m, yes_book, no_book, marks: dict[str, float]) -> None:
         if yes_book.best_ask:
             marks[m.yes_token_id] = yes_book.best_ask
             m.yes_price = yes_book.best_ask
         if no_book and no_book.best_ask and m.no_token_id:
             marks[m.no_token_id] = no_book.best_ask
             m.no_price = no_book.best_ask
+
+    def _skip_xai_search(self) -> bool:
+        if getattr(self.research, "blocked", False):
+            return True
+        return bool(self.engine and self.engine.provider == "gemini")
+
+    async def _consider(self, m, positions, marks: dict[str, float]) -> bool:
+        if not m.yes_token_id:
+            return False
+        try:
+            yes_book, no_book = await self._books(m)
+        except Exception as exc:
+            self.risk.note_api_failure()
+            self.repo.event("API_ERROR", str(exc))
+            return False
+        self._mark_books(m, yes_book, no_book, marks)
         book_reject = filter_book(yes_book, self.settings)
         if book_reject:
             # Only real staleness feeds the repeated_stale_data kill — spread/empty
@@ -191,7 +230,7 @@ class TradingApp:
             if book_reject == "stale_data":
                 self.risk.note_stale()
             self._reject(m, book_reject)
-            return
+            return False
         self.risk.note_book_fresh()
         self.repo.insert_book(
             m.market_id,
@@ -223,16 +262,21 @@ class TradingApp:
             market_price=yes_book.best_ask,
             implied_probability=yes_book.midpoint,
         )
-        try:
-            packet = await self.research.gather(packet)
-        except Exception as exc:
-            self.repo.event("GROK_ERROR", f"research:{exc}")
-            self._reject(m, "research_failed")
-            return
+        if not self._skip_xai_search():
+            try:
+                packet = await self.research.gather(packet)
+            except CreditHardFail as exc:
+                self.repo.event("GROK_ERROR", f"research:{exc}")
+                if self.engine and self.engine.grok:
+                    self.engine.grok.blocked = True
+            except Exception as exc:
+                self.repo.event("GROK_ERROR", f"research:{exc}")
+                self._reject(m, "research_failed")
+                return True
         evid_id = self.repo.insert_evidence(m.market_id, packet.model_dump(mode="json"))
         if self.engine is None:
             self._reject(m, "no_xai_key")
-            return
+            return True
         try:
             est = await self.engine.estimate(packet)
         except InvalidEstimate as exc:
@@ -240,12 +284,15 @@ class TradingApp:
             self.risk.note_ai_error(self.cycle_stats["ai_errors"])
             self.repo.event("GROK_ERROR", exc.reason)
             self._reject(m, exc.reason)
-            return
+            return True
+        if self._pending_ai_provider_notice:
+            await self.notify(self._pending_ai_provider_notice)
+            self._pending_ai_provider_notice = None
         pred_id = self.repo.insert_prediction(
             {
                 "market_id": m.market_id,
                 "prompt_version": self.settings.prompt_version,
-                "model": self.settings.grok_model,
+                "model": self.engine.last_model or self.settings.grok_model,
                 "estimated_probability": est.estimated_probability,
                 "confidence": est.confidence,
                 "confidence_score": est.confidence_score,
@@ -254,10 +301,26 @@ class TradingApp:
                 "evidence_id": evid_id,
             }
         )
+        try:
+            yes_book, no_book = await self._books(m)
+        except Exception as exc:
+            self.risk.note_api_failure()
+            self.repo.event("API_ERROR", str(exc))
+            return True
+        self._mark_books(m, yes_book, no_book, marks)
         exp = exposure_from_positions(positions, marks)
         canary = self.live.authorize_now().allowed
+        edge_floor = self.settings.min_edge
+        if self.engine.provider == "gemini":
+            edge_floor += GEMINI_EDGE_TIGHTEN
         for book in (yes_book, no_book):
             if book is None:
+                continue
+            reason = filter_book(book, self.settings)
+            if reason:
+                if reason == "stale_data":
+                    self.risk.note_stale()
+                self._reject(m, reason)
                 continue
             key = idempotency_key(
                 m.market_id,
@@ -280,9 +343,10 @@ class TradingApp:
                 duplicate=duplicate,
                 halted=self.repo.state().halted,
                 broker_ok=self.paper.operational(),
-                data_fresh=filter_book(book, self.settings) is None,
+                data_fresh=True,
                 canary=canary,
                 open_positions=len(positions),
+                min_edge=edge_floor,
             )
             did = self.repo.insert_decision(
                 {
@@ -315,6 +379,7 @@ class TradingApp:
                 self.repo.event("TRADE_REJECTED", err)
             positions = await self.paper.positions()
             break  # one token per market per cycle
+        return True
 
     def _reject(self, m, reason: str) -> None:
         self.cycle_stats["rejected"] += 1

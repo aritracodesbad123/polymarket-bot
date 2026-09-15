@@ -66,6 +66,15 @@ def test_risk_limit(tmp_path):
     assert not d.approved
 
 
+def test_gemini_edge_tighten(tmp_path):
+    # ask 0.40, p=0.46 → edge 0.06; Grok floor 0.05 passes, Gemini +2¢ (0.07) fails
+    d = _eval(tmp_path, estimate=estimate(0.46))
+    assert d.approved
+    d2 = _eval(tmp_path, estimate=estimate(0.46), min_edge=0.07)
+    assert not d2.approved
+    assert d2.reject_reason == "edge_too_small"
+
+
 def test_correlation_limit(tmp_path):
     d = _eval(tmp_path, existing_group_exposure=1000)
     assert not d.approved

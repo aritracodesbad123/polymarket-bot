@@ -1,11 +1,8 @@
 # Model-fallback stack (discussion verdict)
 
-**Status:** discussion verdict only. **Not implemented.**
+**Status:** implemented on the POLYGROK `app/ai` path (Grok preflight → Vertex Gemini 3.xx then 2.xx).
 **Date:** 2026-09-15
-**Agreed by:** Tom / John / Max (unanimous)
-**Implementation:** deferred until Aritra green-lights coding.
-
-This is a discussion-level design. Do not treat it as live behavior. Do not code it unless Aritra says implement.
+**Agreed by:** Tom / John / Max (unanimous); Aritra green-lit coding.
 
 ## Context
 
