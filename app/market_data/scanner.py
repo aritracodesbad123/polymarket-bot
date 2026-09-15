@@ -90,9 +90,46 @@ class MarketScanner:
         scored = [(m, filter_market(m, self.settings)) for m in markets]
         passers = [(m, r) for m, r in scored if r is None]
         others = [(m, r) for m, r in scored if r is not None]
-        # Passers first (already liquidity/volume ranked from client), then the rest
         ordered = passers + others
-        return ordered[:cycle_n]
+        tags = [t.lower() for t in (self.settings.universe_tags or ())]
+        if len(tags) <= 1 or cycle_n < len(tags):
+            return ordered[:cycle_n]
+        # Final cut must also reserve slots — pool diversify alone still puts one
+        # tag's block first, so [:cycle_n] was crypto-only.
+        per = max(cycle_n // len(tags), 1)
+        picked: list[tuple] = []
+        seen: set[str] = set()
+
+        def _tag_of(m) -> str:
+            cat = (m.category or "").lower()
+            for t in tags:
+                if t == cat or t in cat:
+                    return t
+            blob = f"{cat} {(m.question or '').lower()}"
+            for t in tags:
+                if t in blob:
+                    return t
+            return cat or "other"
+
+        for t in tags:
+            n = 0
+            for m, r in ordered:
+                if m.market_id in seen:
+                    continue
+                if _tag_of(m) != t:
+                    continue
+                picked.append((m, r))
+                seen.add(m.market_id)
+                n += 1
+                if n >= per:
+                    break
+        for m, r in ordered:
+            if len(picked) >= cycle_n:
+                break
+            if m.market_id not in seen:
+                picked.append((m, r))
+                seen.add(m.market_id)
+        return picked[:cycle_n]
 
     async def candidates(self) -> list[Market]:
         rows = await self.scan()
