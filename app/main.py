@@ -53,6 +53,18 @@ GEMINI_MIN_CONFIDENCE = 0.50
 GEMINI_MIN_EXEC_EDGE = 0.02  # fee-aware floor while on Gemini
 
 
+def _spread_bucket(spread: float) -> str:
+    """Bucket rejected spreads for console/KPI (cents on a 0-1 book)."""
+    c = spread * 100.0
+    if c <= 6:
+        return "le_6c"
+    if c <= 10:
+        return "7_10c"
+    if c <= 15:
+        return "11_15c"
+    return "gt_15c"
+
+
 def _soft_ai_reject(reason: str) -> bool:
     """Cooldown-miss / cooldown / cascade exhaustion should abstain, not trip AI kill."""
     r = (reason or "").lower()
@@ -269,7 +281,15 @@ class TradingApp:
             # rejects must not inflate that counter (false halt under Survival Mode).
             if book_reject == "stale_data":
                 self.risk.note_stale()
-            self._reject(m, book_reject)
+            extra = {}
+            if book_reject == "spread_too_wide" and yes_book.spread is not None:
+                extra = {
+                    "spread": float(yes_book.spread),
+                    "max_spread": float(self.settings.max_spread),
+                    "best_bid": yes_book.best_bid,
+                    "best_ask": yes_book.best_ask,
+                }
+            self._reject(m, book_reject, extra=extra)
             return False
         self.risk.note_book_fresh()
         self.repo.insert_book(
@@ -363,7 +383,15 @@ class TradingApp:
             if reason:
                 if reason == "stale_data":
                     self.risk.note_stale()
-                self._reject(m, reason)
+                extra = {}
+                if reason == "spread_too_wide" and book.spread is not None:
+                    extra = {
+                        "spread": float(book.spread),
+                        "max_spread": float(self.settings.max_spread),
+                        "best_bid": book.best_bid,
+                        "best_ask": book.best_ask,
+                    }
+                self._reject(m, reason, extra=extra)
                 continue
             key = idempotency_key(
                 m.market_id,
@@ -426,9 +454,29 @@ class TradingApp:
             break  # one token per market per cycle
         return True
 
-    def _reject(self, m, reason: str) -> None:
+    def _reject(self, m, reason: str, extra: dict | None = None) -> None:
         self.cycle_stats["rejected"] += 1
-        gates = {reason: {"passed": False, "detail": ""}, "ai_provider": {"passed": True, "detail": self._provider_tag()}}
+        extra = dict(extra or {})
+        detail = ""
+        if reason == "spread_too_wide" and extra.get("spread") is not None:
+            detail = f"spread={float(extra['spread']):.4f} max={float(extra.get('max_spread', self.settings.max_spread)):.4f}"
+        gates = {
+            reason: {"passed": False, "detail": detail},
+            "ai_provider": {"passed": True, "detail": self._provider_tag()},
+        }
+        if reason == "spread_too_wide" and extra.get("spread") is not None:
+            gates["spread_width"] = {
+                "passed": False,
+                "detail": detail,
+                "spread": float(extra["spread"]),
+                "max_spread": float(extra.get("max_spread", self.settings.max_spread)),
+                "best_bid": extra.get("best_bid"),
+                "best_ask": extra.get("best_ask"),
+                "bucket": _spread_bucket(float(extra["spread"])),
+            }
+        payload = {"market_id": m.market_id, **extra}
+        if "spread" in extra:
+            payload["spread_bucket"] = _spread_bucket(float(extra["spread"]))
         self.repo.insert_decision(
             {
                 "market_id": m.market_id,
@@ -439,7 +487,7 @@ class TradingApp:
                 "prompt_version": self.settings.prompt_version,
             }
         )
-        self.repo.event("TRADE_REJECTED", reason, {"market_id": m.market_id})
+        self.repo.event("TRADE_REJECTED", reason, payload)
 
     async def run_forever(self) -> None:
         await self.start_clock()
