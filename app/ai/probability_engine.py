@@ -76,8 +76,8 @@ class ProbabilityEngine:
             if self.on_provider_swap:
                 self.on_provider_swap(self.gemini.last_model)
 
-    # Near-certain extremes are usually model overconfidence, not tradeable edge.
-    EXTREME_P = 0.02  # abstain if p < 0.02 or p > 0.98
+    # Only hard-abstain exact 0/1. Soft near-extremes are gated by strategy edge/confidence.
+    # ponytail: was 0.02 band; that burned ~60% of Gemini estimates as grok_abstain with empty search.
 
     def _finish(self, est: MarketEstimate, packet: EvidencePacket) -> MarketEstimate:
         if est.market_id and est.market_id != packet.market_id:
@@ -85,7 +85,7 @@ class ProbabilityEngine:
         if not (0.0 <= est.estimated_probability <= 1.0):
             raise InvalidEstimate("probability_out_of_range")
         p = est.estimated_probability
-        if p < self.EXTREME_P or p > (1.0 - self.EXTREME_P):
+        if p <= 0.0 or p >= 1.0:
             est.should_abstain = True
             est.abstention_reason = f"extreme_probability:{p:.4f}"
         return est

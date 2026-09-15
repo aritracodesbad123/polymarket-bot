@@ -47,10 +47,11 @@ MODE: HALTED
 ========================================
 """.strip()
 
-GEMINI_EDGE_TIGHTEN = 0.02
+# Temporary Gemini tighten (verdict: +1–2¢). Kept light so paper can clear edge while Grok is down.
+GEMINI_EDGE_TIGHTEN = 0.01
 GEMINI_KELLY_MULTIPLIER = 0.125
-GEMINI_MIN_CONFIDENCE = 0.50
-GEMINI_MIN_EXEC_EDGE = 0.02  # fee-aware floor while on Gemini
+GEMINI_MIN_CONFIDENCE = 0.40
+GEMINI_MIN_EXEC_EDGE = 0.01
 
 
 def _spread_bucket(spread: float) -> str:

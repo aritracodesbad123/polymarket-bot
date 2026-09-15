@@ -39,6 +39,12 @@ class EvidencePacket(BaseModel):
             f"Base rate: {self.base_rate_note or 'not provided'}",
             "Evidence:",
         ]
+        if not self.items:
+            lines.append(
+                "(none) No live search packet. Estimate from resolution criteria, "
+                "base rates, and market implied probability. Do not abstain solely "
+                "because this list is empty."
+            )
         for i, it in enumerate(self.items, 1):
             tag = "COUNTER" if it.is_counter else it.kind
             ts = it.source_timestamp.isoformat() if it.source_timestamp else "unknown"

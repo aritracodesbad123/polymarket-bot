@@ -21,17 +21,35 @@ def _est(p: float) -> MarketEstimate:
     )
 
 
-def test_extreme_high_abstains():
-    out = _eng()._finish(_est(0.998), EvidencePacket(market_id="m1", question="q", resolution_criteria="r"))
+def test_exact_one_abstains():
+    out = _eng()._finish(_est(1.0), EvidencePacket(market_id="m1", question="q", resolution_criteria="r"))
     assert out.should_abstain is True
     assert "extreme_probability" in out.abstention_reason
 
 
-def test_extreme_low_abstains():
-    out = _eng()._finish(_est(0.01), EvidencePacket(market_id="m1", question="q", resolution_criteria="r"))
+def test_exact_zero_abstains():
+    out = _eng()._finish(_est(0.0), EvidencePacket(market_id="m1", question="q", resolution_criteria="r"))
     assert out.should_abstain is True
+
+
+def test_near_extreme_does_not_auto_abstain():
+    # Soft extremes used to force grok_abstain and burned the Gemini paper run.
+    out = _eng()._finish(_est(0.01), EvidencePacket(market_id="m1", question="q", resolution_criteria="r"))
+    assert out.should_abstain is False
 
 
 def test_mid_range_ok():
     out = _eng()._finish(_est(0.55), EvidencePacket(market_id="m1", question="q", resolution_criteria="r"))
     assert out.should_abstain is False
+
+
+def test_empty_evidence_prompt_does_not_invite_abstain():
+    pkt = EvidencePacket(
+        market_id="m1",
+        question="Will X happen?",
+        resolution_criteria="Official source.",
+        implied_probability=0.42,
+    )
+    block = pkt.to_prompt_block()
+    assert "No live search packet" in block
+    assert "Do not abstain solely" in block
