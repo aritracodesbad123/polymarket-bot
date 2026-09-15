@@ -53,6 +53,24 @@ GEMINI_MIN_CONFIDENCE = 0.50
 GEMINI_MIN_EXEC_EDGE = 0.02  # fee-aware floor while on Gemini
 
 
+def _soft_ai_reject(reason: str) -> bool:
+    """Cooldown-miss / cooldown / cascade exhaustion should abstain, not trip AI kill."""
+    r = (reason or "").lower()
+    return any(
+        s in r
+        for s in (
+            "gemini_cooldown",
+            "gemini_cascade_exhausted",
+            "gemini_error:gemini_cooldown",
+            "parse miss",
+            "malformed_gemini_output",
+            "xai_credits_exhausted",
+            "no_provider",
+        )
+    )
+
+
+
 def banner_for(settings: Settings, repo: Repositories) -> str:
     st = repo.state()
     if st.halted:
@@ -302,11 +320,16 @@ class TradingApp:
         try:
             est = await self.engine.estimate(packet)
         except InvalidEstimate as exc:
-            self.cycle_stats["ai_errors"] += 1
-            self.risk.note_ai_error(self.cycle_stats["ai_errors"])
             self.repo.event("GROK_ERROR", exc.reason)
+            # Soft Gemini rejects (cooldown / cascade parse-miss) must not inflate
+            # repeated_ai_errors — same class of bug as counting spread as stale.
+            if not _soft_ai_reject(exc.reason):
+                self.cycle_stats["ai_errors"] += 1
+                self.risk.note_ai_error(self.cycle_stats["ai_errors"])
             self._reject(m, exc.reason)
             return True
+        # Successful estimate clears hard AI-error streak.
+        self.cycle_stats["ai_errors"] = 0
         if self._pending_ai_provider_notice:
             await self.notify(self._pending_ai_provider_notice)
             self._pending_ai_provider_notice = None
