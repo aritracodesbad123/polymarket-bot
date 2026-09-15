@@ -1,0 +1,180 @@
+"""Environment → Settings. Paper mode never reads PRIVATE_KEY."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Literal
+
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+
+DIR = Path(__file__).resolve().parent.parent
+
+TradingMode = Literal["paper", "live"]
+
+
+def _f(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    return default if raw is None or raw == "" else float(raw)
+
+
+def _i(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    return default if raw is None or raw == "" else int(raw)
+
+
+def _b(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _s(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    return default if raw is None or raw == "" else raw.strip()
+
+
+class Settings(BaseModel):
+    trading_mode: TradingMode = "paper"
+    live_trading_enabled: bool = False
+
+    xai_api_key: str | None = None
+    grok_model: str = "grok-4.6"
+
+    polymarket_api_url: str = "https://clob.polymarket.com"
+    polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
+    polymarket_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+    paper_starting_bankroll: float = 1000.0
+    paper_latency_ms: int = 150
+    db_path: str = "polygrok.db"
+
+    strategy_version: str = "1"
+    prompt_version: str = "probability_v1"
+    min_edge: float = 0.05
+    kelly_multiplier: float = 0.25
+
+    max_position_pct_bankroll: float = 0.03
+    max_market_exposure_pct: float = 0.05
+    max_total_exposure_pct: float = 0.25
+    max_category_exposure_pct: float = 0.10
+    max_correlation_group_exposure_pct: float = 0.10
+    max_slippage_pct: float = 0.02
+    max_daily_loss_pct: float = 0.05
+    max_consecutive_losses: int = 5
+    min_liquidity_multiple: float = 3.0
+
+    min_liquidity: float = 500.0
+    min_volume: float = 2000.0
+    max_spread: float = 0.06
+    min_time_to_resolution_hours: float = 6.0
+    max_time_to_resolution_hours: float = 720.0
+    max_markets_per_cycle: int = 50
+    max_grok_calls_per_cycle: int = 8
+    max_data_age_seconds: float = 15.0
+    loop_seconds: float = 30.0
+    min_confidence_score: float = 0.4
+
+    canary_max_order_usd: float = 5.0
+    canary_max_daily_notional_usd: float = 20.0
+    canary_max_open_positions: int = 3
+
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+
+    market_blacklist: tuple[str, ...] = Field(default_factory=tuple)
+    category_blacklist: tuple[str, ...] = Field(default_factory=tuple)
+
+    @classmethod
+    def from_env(cls, *, dotenv_path: Path | None = None) -> Settings:
+        load_dotenv(dotenv_path or (DIR / ".env"), override=False)
+        mode_raw = _s("TRADING_MODE", "paper").lower()
+        trading_mode: TradingMode = "live" if mode_raw == "live" else "paper"
+        blacklist = tuple(
+            x.strip() for x in _s("MARKET_BLACKLIST", "").split(",") if x.strip()
+        )
+        cat_bl = tuple(
+            x.strip() for x in _s("CATEGORY_BLACKLIST", "").split(",") if x.strip()
+        )
+        xai = os.environ.get("XAI_API_KEY") or None
+        tg_token = os.environ.get("TELEGRAM_BOT_TOKEN") or None
+        tg_chat = os.environ.get("TELEGRAM_CHAT_ID") or None
+        return cls(
+            trading_mode=trading_mode,
+            live_trading_enabled=_b("LIVE_TRADING_ENABLED", False),
+            xai_api_key=xai,
+            grok_model=_s("GROK_MODEL", "grok-4.6"),
+            polymarket_api_url=_s("POLYMARKET_API_URL", "https://clob.polymarket.com"),
+            polymarket_gamma_url=_s(
+                "POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com"
+            ),
+            polymarket_ws_url=_s(
+                "POLYMARKET_WS_URL",
+                "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+            ),
+            paper_starting_bankroll=_f("PAPER_STARTING_BANKROLL", 1000.0),
+            paper_latency_ms=_i("PAPER_LATENCY_MS", 150),
+            db_path=_s("DB_PATH", "polygrok.db"),
+            strategy_version=_s("STRATEGY_VERSION", "1"),
+            prompt_version=_s("PROMPT_VERSION", "probability_v1"),
+            min_edge=_f("MIN_EDGE", 0.05),
+            kelly_multiplier=_f("KELLY_MULTIPLIER", 0.25),
+            max_position_pct_bankroll=_f("MAX_POSITION_PCT_BANKROLL", 0.03),
+            max_market_exposure_pct=_f("MAX_MARKET_EXPOSURE_PCT", 0.05),
+            max_total_exposure_pct=_f("MAX_TOTAL_EXPOSURE_PCT", 0.25),
+            max_category_exposure_pct=_f("MAX_CATEGORY_EXPOSURE_PCT", 0.10),
+            max_correlation_group_exposure_pct=_f(
+                "MAX_CORRELATION_GROUP_EXPOSURE_PCT", 0.10
+            ),
+            max_slippage_pct=_f("MAX_SLIPPAGE_PCT", 0.02),
+            max_daily_loss_pct=_f("MAX_DAILY_LOSS_PCT", 0.05),
+            max_consecutive_losses=_i("MAX_CONSECUTIVE_LOSSES", 5),
+            min_liquidity_multiple=_f("MIN_LIQUIDITY_MULTIPLE", 3.0),
+            min_liquidity=_f("MIN_LIQUIDITY", 500.0),
+            min_volume=_f("MIN_VOLUME", 2000.0),
+            max_spread=_f("MAX_SPREAD", 0.06),
+            min_time_to_resolution_hours=_f("MIN_TIME_TO_RESOLUTION_HOURS", 6.0),
+            max_time_to_resolution_hours=_f("MAX_TIME_TO_RESOLUTION_HOURS", 720.0),
+            max_markets_per_cycle=_i("MAX_MARKETS_PER_CYCLE", 50),
+            max_grok_calls_per_cycle=_i("MAX_GROK_CALLS_PER_CYCLE", 8),
+            max_data_age_seconds=_f("MAX_DATA_AGE_SECONDS", 15.0),
+            loop_seconds=_f("LOOP_SECONDS", 30.0),
+            min_confidence_score=_f("MIN_CONFIDENCE_SCORE", 0.4),
+            canary_max_order_usd=_f("CANARY_MAX_ORDER_USD", 5.0),
+            canary_max_daily_notional_usd=_f("CANARY_MAX_DAILY_NOTIONAL_USD", 20.0),
+            canary_max_open_positions=_i("CANARY_MAX_OPEN_POSITIONS", 3),
+            telegram_bot_token=tg_token,
+            telegram_chat_id=tg_chat,
+            market_blacklist=blacklist,
+            category_blacklist=cat_bl,
+        )
+
+    def public_dict(self) -> dict:
+        d = self.model_dump()
+        d.pop("xai_api_key", None)
+        d.pop("telegram_bot_token", None)
+        return d
+
+    def config_hash(self) -> str:
+        payload = json.dumps(self.public_dict(), sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def live_credentials_present() -> bool:
+    """True if env has a key + wallet. Does not load them into Settings."""
+    key = os.environ.get("PRIVATE_KEY") or os.environ.get("POLYMARKET_PRIVATE_KEY")
+    wallet = os.environ.get("POLYMARKET_WALLET_ADDRESS")
+    return bool(key and wallet)
+
+
+def load_live_credentials() -> tuple[str, str]:
+    """Return (private_key, wallet). Caller must already have live authorization."""
+    key = os.environ.get("PRIVATE_KEY") or os.environ.get("POLYMARKET_PRIVATE_KEY")
+    wallet = os.environ.get("POLYMARKET_WALLET_ADDRESS")
+    if not key or not wallet:
+        raise PermissionError("live credentials missing")
+    return key, wallet

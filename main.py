@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Polymarket paper bot — article stack, Pay-or-Die constraints.
+"""LEGACY — frozen. Do not extend.
+
+POLYGROK lives in `app/` (`python -m app.cli`). This file is the old Gemini
+paper bot (CLOB V1 / py-clob-client). Its paper clock does not count toward
+POLYGROK's 7-day live lock.
+
+Polymarket paper bot — article stack, Pay-or-Die constraints.
 
 Pipeline (Vincent, Jun 2026):
     DATA → AI/heuristic p → MATH (EV, Quarter Kelly, Bayes, log-return) → GTC paper fills → SQLite + JSON log
@@ -10,7 +16,7 @@ Env (optional):
     GEMINI_API_KEY / GOOGLE_API_KEY   preferred brain
     GEMINI_MODEL                      default gemini-3.6-flash
     ANTHROPIC_API_KEY                 Claude fallback if Gemini is unset
-    AI_SCAN_LIMIT                     max AI calls per cycle (default 8)
+    AI_SCAN_LIMIT                     max AI calls per cycle (default 2)
 
 Run:
     python main.py --check
@@ -94,15 +100,30 @@ STOP_LOSS = 0.03
 TREND_BARS = 8
 TREND_MOVE = 0.025
 REVERSION_SPIKE = 0.04
-AI_SCAN_LIMIT = int(os.environ.get("AI_SCAN_LIMIT") or os.environ.get("CLAUDE_SCAN_LIMIT", "8"))
+AI_SCAN_LIMIT = int(os.environ.get("AI_SCAN_LIMIT") or os.environ.get("CLAUDE_SCAN_LIMIT", "2"))
+AI_COOLDOWN_SECONDS = 90  # ponytail: fixed 90s on 429; Retry-After if quota stays dead
 
 GAMMA_HOST = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
 VERTEX_GEMINI = "https://aiplatform.googleapis.com/v1/publishers/google/models"
+GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models"
 ANTHROPIC_HOST = "https://api.anthropic.com/v1/messages"
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
-GEMINI_FALLBACKS = ("gemini-3.6-flash", "gemini-3.1-pro-preview")
+# generateContent text models from https://ai.google.dev/gemini-api/docs/models — skip image/live/tts/media
+GEMINI_MODELS = (
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+)
 
 ARB_EDGE = 0.012  # YES ask + NO ask <= 0.988 → locked $1 payout
 BANDIT_ARMS = ("SPREAD_SCALPER", "TREND_RIDER", "MEAN_REVERSION")
@@ -254,6 +275,19 @@ def _gemini_key() -> str | None:
     return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
 
+def _gemini_chain() -> list[tuple[str, str, str]]:
+    """(model, url, host) — env model first, then docs list; Vertex then AI Studio."""
+    models: list[str] = []
+    for m in (GEMINI_MODEL, *GEMINI_MODELS):
+        if m not in models:
+            models.append(m)
+    out: list[tuple[str, str, str]] = []
+    for model in models:
+        out.append((model, f"{VERTEX_GEMINI}/{model}:generateContent", "vertex"))
+        out.append((model, f"{GEMINI_API}/{model}:generateContent", "aistudio"))
+    return out
+
+
 def brain_name() -> str:
     if _gemini_key():
         return f"gemini:{GEMINI_MODEL}"
@@ -364,6 +398,8 @@ class PayOrDieBot:
         self.session_started = time.time()
         self.stop_at: float | None = None
         self._arb_taken: dict[str, float] = {}
+        self._ai_cool_until = 0.0
+        self._dead_books: set[str] = set()  # ponytail: session skip; TTL if a 404 ever comes back live
         self._clob = None
         self._load_log()
         if self.live_execution:
@@ -564,16 +600,23 @@ class PayOrDieBot:
 
     def fetch_books(self, token_ids: list[str]) -> dict[str, dict]:
         out: dict[str, dict] = {}
+        live = [t for t in token_ids if t not in self._dead_books]
+        if not live:
+            return out
 
         def one(tid: str) -> tuple[str, dict | None]:
             try:
                 return tid, self.fetch_book(tid)
             except urllib.error.HTTPError as exc:
-                log.warning("book skip %s: %s", tid[:16], exc)
+                if exc.code == 404:
+                    self._dead_books.add(tid)
+                    log.info("book 404 %s — skip rest of session", tid[:16])
+                else:
+                    log.warning("book skip %s: %s", tid[:16], exc)
                 return tid, None
 
         with ThreadPoolExecutor(max_workers=BOOK_WORKERS) as pool:
-            futs = [pool.submit(one, tid) for tid in token_ids]
+            futs = [pool.submit(one, tid) for tid in live]
             for fut in as_completed(futs):
                 tid, book = fut.result()
                 if book:
@@ -582,6 +625,8 @@ class PayOrDieBot:
 
     # ----- AI brain -------------------------------------------------------
     def gemini_probability(self, question: str, mid: float, spread: float) -> float | None:
+        if time.time() < self._ai_cool_until:
+            return None
         key = _gemini_key()
         if not key:
             return None
@@ -597,37 +642,30 @@ class PayOrDieBot:
                 },
             }
         ).encode()
-        models = []
-        for m in (GEMINI_MODEL, *GEMINI_FALLBACKS):
-            if m not in models:
-                models.append(m)
-        data = None
-        last_exc: Exception | None = None
         headers = {"content-type": "application/json", "x-goog-api-key": key}
-        for model in models:
-            url = f"{VERTEX_GEMINI}/{model}:generateContent"
+        last_exc: Exception | None = None
+        for model, url, host in _gemini_chain():
             try:
                 data = http_json(url, method="POST", body=payload, headers=headers, retry=False)
-                if model != GEMINI_MODEL:
-                    log.info("gemini fallback model=%s", model)
-                break
             except urllib.error.HTTPError as exc:
                 last_exc = exc
-                detail = exc.read().decode("utf-8", "replace")[:240]
-                log.warning("gemini %s HTTP %s: %s", model, exc.code, detail)
-                if exc.code == 429:
-                    break
+                exc.read()
+                log.warning("gemini %s %s HTTP %s — next", model, host, exc.code)
+                continue
             except Exception as exc:
                 last_exc = exc
-                log.warning("gemini %s failed: %s", model, exc)
-        if data is None:
-            log.warning("gemini skip: %s", last_exc)
-            return None
-        obj = _parse_json_object(_gemini_text(data))
-        if not obj or "probability" not in obj:
-            log.warning("gemini json miss: %s", _gemini_text(data)[:160])
-            return None
-        return _clamp(float(obj["probability"]), 0.01, 0.99)
+                log.warning("gemini %s %s failed: %s — next", model, host, exc)
+                continue
+            obj = _parse_json_object(_gemini_text(data))
+            if not obj or "probability" not in obj:
+                log.warning("gemini %s %s json miss — next", model, host)
+                continue
+            if model != GEMINI_MODEL or host != "vertex":
+                log.info("gemini fallback model=%s via=%s", model, host)
+            return _clamp(float(obj["probability"]), 0.01, 0.99)
+        self._ai_cool_until = time.time() + AI_COOLDOWN_SECONDS
+        log.warning("gemini chain exhausted — heuristic for %ss (%s)", AI_COOLDOWN_SECONDS, last_exc)
+        return None
 
     def claude_probability(self, question: str, mid: float, spread: float) -> float | None:
         key = os.environ.get("ANTHROPIC_API_KEY")
@@ -665,7 +703,9 @@ class PayOrDieBot:
 
     def ai_probability(self, question: str, mid: float, spread: float) -> float | None:
         if _gemini_key():
-            return self.gemini_probability(question, mid, spread)
+            p = self.gemini_probability(question, mid, spread)
+            if p is not None:
+                return p
         return self.claude_probability(question, mid, spread)
 
     # ----- bandit ---------------------------------------------------------
@@ -918,16 +958,11 @@ class PayOrDieBot:
 
         tradeable = [r for r in rows if self._tradeable(r)]
         ai_p_map: dict[str, float | None] = {}
-        if brain_name() != "heuristic" and tradeable:
-            jobs = tradeable[:AI_SCAN_LIMIT]
-            workers = min(4, len(jobs))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futs = {
-                    pool.submit(self.ai_probability, r["question"], r["mid"], r["spread"]): r["token_id"]
-                    for r in jobs
-                }
-                for fut in as_completed(futs):
-                    ai_p_map[futs[fut]] = fut.result()
+        if brain_name() != "heuristic" and tradeable and time.time() >= self._ai_cool_until:
+            for r in tradeable[:AI_SCAN_LIMIT]:
+                if time.time() < self._ai_cool_until:
+                    break
+                ai_p_map[r["token_id"]] = self.ai_probability(r["question"], r["mid"], r["spread"])
 
         log.info("arm=%s scan=%d tradeable=%d equity=$%.4f", strategy, len(markets), len(tradeable), self.equity())
 
@@ -1026,6 +1061,16 @@ def _self_check() -> None:
     wrapped = _parse_json_object('Here:\n```json\n{"probability": 0.33, "confidence": "low", "reasoning": "t"}\n```')
     assert abs(wrapped["probability"] - 0.33) < 1e-9
     assert abs((1.0 - 0.48 - 0.50) - 0.02) < 1e-9
+    cool = PayOrDieBot.__new__(PayOrDieBot)
+    cool._ai_cool_until = time.time() + 999
+    assert cool.gemini_probability("x", 0.5, 0.02) is None
+    chain = _gemini_chain()
+    assert chain[0][0] == GEMINI_MODEL and chain[0][2] == "vertex"
+    assert any(m == "gemini-3.8-flash" and h == "aistudio" for m, _, h in chain)
+    dead = PayOrDieBot.__new__(PayOrDieBot)
+    dead._dead_books = {"404token"}
+    dead._clob = None
+    assert dead.fetch_books(["404token"]) == {}
     print("self-check ok")
 
 
