@@ -17,7 +17,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-REFRESH_S = 2
+REFRESH_S = 4
 
 
 @st.cache_data(ttl=REFRESH_S, show_spinner=False)

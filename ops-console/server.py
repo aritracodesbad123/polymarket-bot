@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -31,10 +32,12 @@ START_BANKROLL = 50.0
 KILL_FLOOR = 40.0
 DAILY_LOSS_BUDGET = 2.50
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
-# Fresh CLOB every poll so trade MTM tracks the equity chart (no sticky cache).
-_MARKS_TTL_S = 0.0
+# Share marks across overlapping polls so the console doesn't stall.
+_MARKS_TTL_S = 3.0
 _EQUITY_RING: deque[dict[str, float | str]] = deque(maxlen=450)  # ~15m @ 2s
 _MARKS_CACHE: dict[str, Any] = {"t": 0.0, "by_token": {}, "ok": False, "err": None}
+_MARKS_LOCK = threading.Lock()
+_MARKS_FETCHING = False
 
 app = FastAPI(title="POLYGROK Ops Console")
 
@@ -78,7 +81,7 @@ def _clob_mid(token_id: str) -> tuple[float | None, float | None, float | None]:
             "Accept": "application/json",
         },
     )
-    with urllib.request.urlopen(req, timeout=6) as resp:
+    with urllib.request.urlopen(req, timeout=3) as resp:
         data = json.loads(resp.read().decode())
     bids = data.get("bids") or []
     asks = data.get("asks") or []
@@ -95,59 +98,73 @@ def _clob_mid(token_id: str) -> tuple[float | None, float | None, float | None]:
 
 
 def live_marks_by_token(con: sqlite3.Connection) -> dict[str, Any]:
-    """Fresh CLOB mids for open positions. Cached ~1 tick so /api/snapshot stays snappy."""
+    """CLOB mids for open positions. Cached + single-flight so polls don't stack."""
+    global _MARKS_FETCHING
     now = time.time()
     if now - float(_MARKS_CACHE["t"]) < _MARKS_TTL_S and _MARKS_CACHE["by_token"]:
-        return _MARKS_CACHE
-    if not _has_positions_cols(con):
-        _MARKS_CACHE.update({"t": now, "by_token": {}, "ok": False, "err": "no positions"})
-        return _MARKS_CACHE
-    rows = con.execute(
-        "SELECT token_id, market_id, shares, avg_price FROM positions WHERE shares != 0"
-    ).fetchall()
-    by_token: dict[str, dict[str, Any]] = {}
-    err: str | None = None
-    ok_n = 0
-    if rows:
-        with ThreadPoolExecutor(max_workers=min(8, len(rows))) as pool:
-            futs = {pool.submit(_clob_mid, str(r["token_id"])): r for r in rows}
-            for fut in as_completed(futs):
-                r = futs[fut]
-                tid = str(r["token_id"])
-                entry = float(r["avg_price"] or 0)
-                shares = float(r["shares"] or 0)
-                bid = ask = mid = None
-                try:
-                    bid, ask, mid = fut.result()
-                    if mid is not None:
-                        ok_n += 1
-                except Exception as exc:
-                    err = str(exc)
-                    mid = None
-                mark = float(mid) if mid is not None else entry
-                by_token[tid] = {
-                    "token_id": tid,
-                    "market_id": r["market_id"],
-                    "shares": shares,
-                    "entry": entry,
-                    "mark": mark,
-                    "bid": bid,
-                    "ask": ask,
-                    "live_book": mid is not None,
-                    "unrealized": (mark - entry) * shares,
-                    "notional": shares * mark,
+        return dict(_MARKS_CACHE)
+    with _MARKS_LOCK:
+        # Another request already refreshing — serve last good marks.
+        if _MARKS_FETCHING and _MARKS_CACHE.get("by_token"):
+            return dict(_MARKS_CACHE)
+        if now - float(_MARKS_CACHE["t"]) < _MARKS_TTL_S and _MARKS_CACHE["by_token"]:
+            return dict(_MARKS_CACHE)
+        _MARKS_FETCHING = True
+    try:
+        if not _has_positions_cols(con):
+            with _MARKS_LOCK:
+                _MARKS_CACHE.update({"t": time.time(), "by_token": {}, "ok": False, "err": "no positions"})
+                return dict(_MARKS_CACHE)
+        rows = con.execute(
+            "SELECT token_id, market_id, shares, avg_price FROM positions WHERE shares != 0"
+        ).fetchall()
+        by_token: dict[str, dict[str, Any]] = {}
+        err: str | None = None
+        ok_n = 0
+        if rows:
+            with ThreadPoolExecutor(max_workers=min(8, len(rows))) as pool:
+                futs = {pool.submit(_clob_mid, str(r["token_id"])): r for r in rows}
+                for fut in as_completed(futs):
+                    r = futs[fut]
+                    tid = str(r["token_id"])
+                    entry = float(r["avg_price"] or 0)
+                    shares = float(r["shares"] or 0)
+                    bid = ask = mid = None
+                    try:
+                        bid, ask, mid = fut.result()
+                        if mid is not None:
+                            ok_n += 1
+                    except Exception as exc:
+                        err = str(exc)
+                        mid = None
+                    mark = float(mid) if mid is not None else entry
+                    by_token[tid] = {
+                        "token_id": tid,
+                        "market_id": r["market_id"],
+                        "shares": shares,
+                        "entry": entry,
+                        "mark": mark,
+                        "bid": bid,
+                        "ask": ask,
+                        "live_book": mid is not None,
+                        "unrealized": (mark - entry) * shares,
+                        "notional": shares * mark,
+                    }
+        with _MARKS_LOCK:
+            _MARKS_CACHE.update(
+                {
+                    "t": time.time(),
+                    "by_token": by_token,
+                    "ok": ok_n > 0,
+                    "err": None if ok_n else err,
+                    "fetched": ok_n,
+                    "open": len(rows),
                 }
-    _MARKS_CACHE.update(
-        {
-            "t": now,
-            "by_token": by_token,
-            "ok": ok_n > 0,
-            "err": None if ok_n else err,
-            "fetched": ok_n,
-            "open": len(rows),
-        }
-    )
-    return _MARKS_CACHE
+            )
+            return dict(_MARKS_CACHE)
+    finally:
+        with _MARKS_LOCK:
+            _MARKS_FETCHING = False
 
 
 def agent_status() -> dict[str, Any]:
@@ -1200,7 +1217,7 @@ function render(d){
   drawEquityChart(d);
 }
 tick();
-setInterval(tick, 2000);
+setInterval(tick, 4000);
 </script>
 </body>
 </html>
