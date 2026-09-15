@@ -17,10 +17,10 @@ log = logging.getLogger(__name__)
 VERTEX = "https://aiplatform.googleapis.com/v1/publishers/google/models"  # Vertex only; not generativelanguage.googleapis.com
 COOLDOWN_SECONDS = 90.0
 
-# Prefer models that actually resolve on Vertex with this API key.
-# Skip fantasy 3.1-pro ids that 404 and burn the cascade into cooldown.
 # Vertex publisher API (x-goog-api-key) — NOT AI Studio / generativelanguage.
-# Prefer gemini-3.6-flash first (confirmed working on this Vertex key).
+# Prefer gemini-3.6-flash when healthy; on HTTP 429 fall through the rest of the cascade
+# in the SAME call (2.5-flash next). Sticky skip keeps a hot 429 model out of the first
+# slot for a short window so we don't re-burn it every estimate.
 GEMINI_CASCADE = (
     "gemini-3.6-flash",
     "gemini-2.5-flash",
@@ -31,6 +31,7 @@ GEMINI_CASCADE = (
     "gemini-3.7-flash",
     "gemini-3-flash-preview",
 )
+STICKY_429_SECONDS = 120.0
 
 SCHEMA_HINT = """Return ONLY one JSON object (no markdown) with exactly these keys:
 market_id (string),
@@ -170,6 +171,7 @@ class GeminiClient:
         self._cool_until = 0.0
         self._post = post
         self._lock = asyncio.Lock()  # serialize calls — concurrent hammer → blank httpx fails + cooldown
+        self._skip_until: dict[str, float] = {}  # model -> epoch when 429 sticky expires
 
     async def estimate(self, system_prompt: str, user_prompt: str) -> MarketEstimate:
         async with self._lock:
@@ -191,7 +193,10 @@ class GeminiClient:
         headers = {"content-type": "application/json", "x-goog-api-key": self.api_key}
         last_exc: Exception | None = None
         saw_success_http = False
-        for model in gemini_cascade():
+        now = time.time()
+        primary = [m for m in gemini_cascade() if self._skip_until.get(m, 0) <= now]
+        deferred = [m for m in gemini_cascade() if self._skip_until.get(m, 0) > now]
+        for model in primary + deferred:
             url = f"{VERTEX}/{model}:generateContent"
             log.warning("gemini attempt model=%s", model)
             try:
@@ -207,6 +212,16 @@ class GeminiClient:
             if status == 404:
                 last_exc = RuntimeError(f"gemini HTTP 404")
                 log.warning("gemini %s HTTP 404 body_head=%r — next", model, (body or "")[:240])
+                continue
+            if status == 429:
+                last_exc = RuntimeError(f"gemini HTTP 429")
+                self._skip_until[model] = time.time() + STICKY_429_SECONDS
+                log.warning(
+                    "gemini %s HTTP 429 — sticky-skip %ss, try next model body_head=%r",
+                    model,
+                    int(STICKY_429_SECONDS),
+                    (body or "")[:240],
+                )
                 continue
             if status >= 400:
                 last_exc = RuntimeError(f"gemini HTTP {status}")

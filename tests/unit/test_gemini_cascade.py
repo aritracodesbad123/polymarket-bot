@@ -41,3 +41,8 @@ def test_parse_probability_alias():
     raw = '{"market_id":"m1","probability":0.6,"confidence":"medium","confidence_score":0.7,"base_rate_probability":0.5,"evidence_adjustment":0.1,"key_evidence":[],"counterarguments":[],"uncertainty_factors":[],"stale_information_risk":"low","should_abstain":false,"abstention_reason":"","reasoning_summary":"ok"}'
     est = parse_estimate_json(raw)
     assert est.estimated_probability == 0.6
+
+
+def test_cascade_has_25_after_36():
+    c = list(gemini_cascade())
+    assert c.index("gemini-2.5-flash") > c.index("gemini-3.6-flash")
