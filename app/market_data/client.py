@@ -267,6 +267,50 @@ class PolymarketClient:
                 offset += page_size
         return rank_markets_for_universe(out)[:limit]
 
+    async def list_markets_for_tag(self, tag_slug: str, *, limit: int = 50) -> list[Market]:
+        """Pull open markets from Gamma events filtered by tag_slug (e.g. crypto)."""
+        import httpx
+
+        pool_target = max(limit * 5, 250)
+        out: list[Market] = []
+        offset = 0
+        page_size = 50
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            while len(out) < pool_target:
+                params = {
+                    "closed": "false",
+                    "limit": str(page_size),
+                    "offset": str(offset),
+                    "tag_slug": tag_slug,
+                    "order": "liquidity",
+                    "ascending": "false",
+                }
+                r = await http.get(f"{self.gamma_url}/events", params=params)
+                r.raise_for_status()
+                events = r.json()
+                if not isinstance(events, list) or not events:
+                    break
+                for ev in events:
+                    for obj in ev.get("markets") or []:
+                        if not isinstance(obj, dict):
+                            continue
+                        # Stamp crypto (or tag) category when Gamma leaves category empty.
+                        if not obj.get("category"):
+                            obj = {**obj, "category": tag_slug}
+                        m = market_from_sdk(obj)
+                        if m:
+                            if not m.category or m.category == "other":
+                                m.category = tag_slug
+                            out.append(m)
+                        if len(out) >= pool_target:
+                            break
+                    if len(out) >= pool_target:
+                        break
+                if len(events) < page_size:
+                    break
+                offset += page_size
+        return rank_markets_for_universe(out)[:limit]
+
     async def get_order_book(self, token_id: str, market_id: str = "") -> OrderBook:
         try:
             client = await self._public()

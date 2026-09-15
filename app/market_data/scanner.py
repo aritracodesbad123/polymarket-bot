@@ -24,6 +24,14 @@ def filter_market(m: Market, settings: Settings, now=None) -> str | None:
         return "blacklisted_market"
     if m.category.lower() in {c.lower() for c in settings.category_blacklist}:
         return "blacklisted_category"
+    if settings.universe_tag:
+        tag = settings.universe_tag.lower()
+        cat = (m.category or "").lower()
+        q = (m.question or "").lower()
+        # Prefer stamped tag/category; also accept obvious crypto keywords as belt-and-suspenders.
+        keywords = (tag, "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto")
+        if tag not in cat and not any(k in cat or k in q for k in keywords if k):
+            return "outside_universe"
     if m.liquidity < settings.min_liquidity:
         return "insufficient_liquidity"
     if m.volume < settings.min_volume:
@@ -61,7 +69,12 @@ class MarketScanner:
         """
         cycle_n = self.settings.max_markets_per_cycle
         pool_n = max(cycle_n * 5, 250)
-        markets = await self.client.list_markets(closed=False, limit=pool_n)
+        if self.settings.universe_tag:
+            markets = await self.client.list_markets_for_tag(
+                self.settings.universe_tag, limit=pool_n
+            )
+        else:
+            markets = await self.client.list_markets(closed=False, limit=pool_n)
         scored = [(m, filter_market(m, self.settings)) for m in markets]
         passers = [(m, r) for m, r in scored if r is None]
         others = [(m, r) for m, r in scored if r is not None]
