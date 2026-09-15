@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.polygrok.opsconsole</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/aritrachakraborty/polygrok/polymarket-bot/ops-console/.venv/bin/uvicorn</string>
+		<string>server:app</string>
+		<string>--host</string>
+		<string>127.0.0.1</string>
+		<string>--port</string>
+		<string>8765</string>
+		<string>--log-level</string>
+		<string>warning</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/aritrachakraborty/polygrok/polymarket-bot/ops-console</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/aritrachakraborty/Library/Logs/com.polygrok.opsconsole.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/aritrachakraborty/Library/Logs/com.polygrok.opsconsole.err.log</string>
+</dict>
+</plist>
