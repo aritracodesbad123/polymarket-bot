@@ -480,7 +480,11 @@ class TradingApp:
                     decision.reject_reason,
                     ident["question"][:80],
                 )
-                self.repo.event("TRADE_REJECTED", decision.reject_reason or "", ident)
+                self.repo.event(
+                    "TRADE_REJECTED",
+                    f"{ident['instrument']} | {decision.reject_reason or ''} | {ident['question'][:80]}",
+                    ident,
+                )
                 continue
             self.repo.event("OPPORTUNITY", m.question[:120], {"edge": decision.raw_edge})
             err = await self.executor.execute(decision, did)
@@ -542,7 +546,8 @@ class TradingApp:
             reason,
             ident["question"][:80],
         )
-        self.repo.event("TRADE_REJECTED", reason, payload)
+        msg = f"{ident['instrument']} | {reason} | {ident['question'][:80]}"
+        self.repo.event("TRADE_REJECTED", msg, payload)
 
     async def run_forever(self) -> None:
         await self.start_clock()
