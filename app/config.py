@@ -89,8 +89,8 @@ class Settings(BaseModel):
 
     market_blacklist: tuple[str, ...] = Field(default_factory=tuple)
     category_blacklist: tuple[str, ...] = Field(default_factory=tuple)
-    # If set (e.g. "crypto"), scanner pulls Gamma events for that tag_slug only.
-    universe_tag: str = ""
+    # Comma-separated Gamma event tag_slugs (e.g. "crypto,forex"). Empty = all markets.
+    universe_tags: tuple[str, ...] = Field(default_factory=tuple)
 
     @classmethod
     def from_env(cls, *, dotenv_path: Path | None = None) -> Settings:
@@ -156,7 +156,13 @@ class Settings(BaseModel):
             telegram_chat_id=tg_chat,
             market_blacklist=blacklist,
             category_blacklist=cat_bl,
-            universe_tag=_s("UNIVERSE_TAG", "").strip().lower(),
+            universe_tags=tuple(
+                x.strip().lower()
+                for x in (
+                    _s("UNIVERSE_TAGS", "") or _s("UNIVERSE_TAG", "")
+                ).split(",")
+                if x.strip()
+            ),
         )
 
     def public_dict(self) -> dict:

@@ -24,13 +24,25 @@ def filter_market(m: Market, settings: Settings, now=None) -> str | None:
         return "blacklisted_market"
     if m.category.lower() in {c.lower() for c in settings.category_blacklist}:
         return "blacklisted_category"
-    if settings.universe_tag:
-        tag = settings.universe_tag.lower()
+    if settings.universe_tags:
         cat = (m.category or "").lower()
         q = (m.question or "").lower()
-        # Prefer stamped tag/category; also accept obvious crypto keywords as belt-and-suspenders.
-        keywords = (tag, "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto")
-        if tag not in cat and not any(k in cat or k in q for k in keywords if k):
+        blob = f"{cat} {q}"
+        tags = {t.lower() for t in settings.universe_tags}
+        # Belt-and-suspenders keywords for crypto + FX/metals that may not stamp category.
+        keywords = {
+            "crypto", "bitcoin", "btc", "ethereum", "eth", "solana", "sol",
+            "forex", "fx", "eurusd", "gbpusd", "usdjpy", "xauusd", "xagusd",
+            "xau", "xag", "gold", "silver", "dxy", "usd",
+        }
+        # Keep keyword set relevant to selected tags.
+        if "crypto" not in tags:
+            keywords -= {"crypto", "bitcoin", "btc", "ethereum", "eth", "solana", "sol"}
+        if not tags.intersection({"forex", "fx"}):
+            keywords -= {"forex", "fx", "eurusd", "gbpusd", "usdjpy", "xauusd", "xagusd", "xau", "xag", "gold", "silver", "dxy", "usd"}
+        in_tag = any(t in cat for t in tags)
+        in_kw = any(k in blob for k in keywords)
+        if not in_tag and not in_kw:
             return "outside_universe"
     if m.liquidity < settings.min_liquidity:
         return "insufficient_liquidity"
@@ -69,9 +81,9 @@ class MarketScanner:
         """
         cycle_n = self.settings.max_markets_per_cycle
         pool_n = max(cycle_n * 5, 250)
-        if self.settings.universe_tag:
-            markets = await self.client.list_markets_for_tag(
-                self.settings.universe_tag, limit=pool_n
+        if self.settings.universe_tags:
+            markets = await self.client.list_markets_for_tags(
+                self.settings.universe_tags, limit=pool_n
             )
         else:
             markets = await self.client.list_markets(closed=False, limit=pool_n)

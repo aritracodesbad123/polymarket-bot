@@ -268,48 +268,83 @@ class PolymarketClient:
         return rank_markets_for_universe(out)[:limit]
 
     async def list_markets_for_tag(self, tag_slug: str, *, limit: int = 50) -> list[Market]:
-        """Pull open markets from Gamma events filtered by tag_slug (e.g. crypto)."""
+        return await self.list_markets_for_tags((tag_slug,), limit=limit)
+
+    async def list_markets_for_tags(self, tag_slugs: tuple[str, ...] | list[str], *, limit: int = 50) -> list[Market]:
+        """Pull open markets from Gamma events for one or more tag_slugs (crypto ∪ forex)."""
         import httpx
 
+        tags = [t.strip().lower() for t in tag_slugs if t and str(t).strip()]
+        if not tags:
+            return await self.list_markets(closed=False, limit=limit)
+
         pool_target = max(limit * 5, 250)
+        per_tag = max(pool_target // max(len(tags), 1), 100)
         out: list[Market] = []
-        offset = 0
+        seen: set[str] = set()
         page_size = 50
         async with httpx.AsyncClient(timeout=30.0) as http:
-            while len(out) < pool_target:
-                params = {
-                    "closed": "false",
-                    "limit": str(page_size),
-                    "offset": str(offset),
-                    "tag_slug": tag_slug,
-                    "order": "liquidity",
-                    "ascending": "false",
-                }
-                r = await http.get(f"{self.gamma_url}/events", params=params)
-                r.raise_for_status()
-                events = r.json()
-                if not isinstance(events, list) or not events:
-                    break
-                for ev in events:
-                    for obj in ev.get("markets") or []:
-                        if not isinstance(obj, dict):
-                            continue
-                        # Stamp crypto (or tag) category when Gamma leaves category empty.
-                        if not obj.get("category"):
-                            obj = {**obj, "category": tag_slug}
-                        m = market_from_sdk(obj)
-                        if m:
+            for tag_slug in tags:
+                offset = 0
+                got = 0
+                while got < per_tag and len(out) < pool_target:
+                    params = {
+                        "closed": "false",
+                        "limit": str(page_size),
+                        "offset": str(offset),
+                        "tag_slug": tag_slug,
+                        "order": "liquidity",
+                        "ascending": "false",
+                    }
+                    r = await http.get(f"{self.gamma_url}/events", params=params)
+                    r.raise_for_status()
+                    events = r.json()
+                    if not isinstance(events, list) or not events:
+                        break
+                    for ev in events:
+                        for obj in ev.get("markets") or []:
+                            if not isinstance(obj, dict):
+                                continue
+                            if not obj.get("category"):
+                                obj = {**obj, "category": tag_slug}
+                            m = market_from_sdk(obj)
+                            if not m or m.market_id in seen:
+                                continue
                             if not m.category or m.category == "other":
                                 m.category = tag_slug
+                            seen.add(m.market_id)
                             out.append(m)
-                        if len(out) >= pool_target:
+                            got += 1
+                            if got >= per_tag or len(out) >= pool_target:
+                                break
+                        if got >= per_tag or len(out) >= pool_target:
                             break
-                    if len(out) >= pool_target:
+                    if len(events) < page_size:
                         break
-                if len(events) < page_size:
+                    offset += page_size
+        ranked = rank_markets_for_universe(out)
+        if len(tags) <= 1 or limit < len(tags):
+            return ranked[:limit]
+        # Reserve slots per tag so liquid crypto doesn't crowd out forex/FX.
+        per = max(limit // len(tags), 1)
+        picked: list[Market] = []
+        seen_ids: set[str] = set()
+        for tag in tags:
+            bucket = [m for m in ranked if (m.category or "").lower() == tag or tag in (m.question or "").lower()]
+            for m in bucket:
+                if m.market_id in seen_ids:
+                    continue
+                picked.append(m)
+                seen_ids.add(m.market_id)
+                if sum(1 for x in picked if (x.category or "").lower() == tag) >= per:
                     break
-                offset += page_size
-        return rank_markets_for_universe(out)[:limit]
+        for m in ranked:
+            if len(picked) >= limit:
+                break
+            if m.market_id not in seen_ids:
+                picked.append(m)
+                seen_ids.add(m.market_id)
+        return picked[:limit]
 
     async def get_order_book(self, token_id: str, market_id: str = "") -> OrderBook:
         try:
