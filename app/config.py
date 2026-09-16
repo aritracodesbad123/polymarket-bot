@@ -84,6 +84,18 @@ class Settings(BaseModel):
     canary_max_daily_notional_usd: float = 20.0
     canary_max_open_positions: int = 3
 
+    # Pay-for-yourself adaptive regime
+    regime_enabled: bool = True
+    holding_stop_pct: float = 0.25
+    holding_thesis_edge: float = 0.02
+    holding_max_hours: float = 48.0
+    estimated_usd_per_ai_call: float = 0.02
+    api_die_cushion_usd: float = 0.50
+    defend_edge_tighten: float = 0.02
+    defend_kelly_mult: float = 0.5
+    defend_max_grok_calls: int = 3
+    kill_floor_pct: float = 0.20  # DIE if equity <= start * (1 - this)
+
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
 
@@ -152,6 +164,16 @@ class Settings(BaseModel):
             canary_max_order_usd=_f("CANARY_MAX_ORDER_USD", 5.0),
             canary_max_daily_notional_usd=_f("CANARY_MAX_DAILY_NOTIONAL_USD", 20.0),
             canary_max_open_positions=_i("CANARY_MAX_OPEN_POSITIONS", 3),
+            regime_enabled=_b("REGIME_ENABLED", True),
+            holding_stop_pct=_f("HOLDING_STOP_PCT", 0.25),
+            holding_thesis_edge=_f("HOLDING_THESIS_EDGE", 0.02),
+            holding_max_hours=_f("HOLDING_MAX_HOURS", 48.0),
+            estimated_usd_per_ai_call=_f("ESTIMATED_USD_PER_AI_CALL", 0.02),
+            api_die_cushion_usd=_f("API_DIE_CUSHION_USD", 0.50),
+            defend_edge_tighten=_f("DEFEND_EDGE_TIGHTEN", 0.02),
+            defend_kelly_mult=_f("DEFEND_KELLY_MULT", 0.5),
+            defend_max_grok_calls=_i("DEFEND_MAX_GROK_CALLS", 3),
+            kill_floor_pct=_f("KILL_FLOOR_PCT", 0.20),
             telegram_bot_token=tg_token,
             telegram_chat_id=tg_chat,
             market_blacklist=blacklist,

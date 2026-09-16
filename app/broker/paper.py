@@ -68,11 +68,14 @@ class PaperBroker:
 
     async def submit(self, req: OrderRequest, book: OrderBook, decision: Decision) -> OrderRecord:
         await asyncio.sleep(self.latency_s)
-        if req.side.upper() != "BUY":
+        side = req.side.upper()
+        if side == "SELL":
+            return await self._submit_sell(req, book, decision)
+        if side != "BUY":
             rec = OrderRecord(
                 client_order_id=req.client_order_id,
                 status=OrderStatus.REJECTED,
-                message="paper_v1_buy_only",
+                message="paper_unsupported_side",
             )
             self.records[req.client_order_id] = rec
             return rec
@@ -171,6 +174,65 @@ class PaperBroker:
             if remaining <= 0:
                 break
         return cost, filled
+
+    def _fill_at_or_above(self, book: OrderBook, shares: float, limit: float) -> tuple[float, float]:
+        """SELL: take bids at or above limit (best bid first)."""
+        remaining = shares
+        proceeds = 0.0
+        filled = 0.0
+        for lvl in book.bids:
+            if lvl.price < limit - 1e-12:
+                break
+            take = min(remaining, lvl.size)
+            proceeds += take * lvl.price
+            remaining -= take
+            filled += take
+            if remaining <= 0:
+                break
+        return proceeds, filled
+
+    async def _submit_sell(
+        self, req: OrderRequest, book: OrderBook, decision: Decision
+    ) -> OrderRecord:
+        pos = self._positions.get(req.token_id)
+        if pos is None or pos.shares <= 1e-12:
+            rec = OrderRecord(
+                client_order_id=req.client_order_id,
+                status=OrderStatus.REJECTED,
+                message="no_position",
+            )
+            self.records[req.client_order_id] = rec
+            return rec
+        sell_shares = min(req.size_shares, pos.shares)
+        proceeds, filled = self._fill_at_or_above(book, sell_shares, req.price)
+        if filled <= 0:
+            rec = OrderRecord(
+                client_order_id=req.client_order_id,
+                status=OrderStatus.REJECTED,
+                message="no_bid_fill",
+            )
+            self.records[req.client_order_id] = rec
+            return rec
+        avg_px = proceeds / filled
+        fee = fee_per_share(avg_px, decision.category or pos.category or "other") * filled
+        pnl = (avg_px - pos.avg_price) * filled - fee
+        self.cash += proceeds - fee
+        self.fees_paid += fee
+        self.realized_pnl += pnl
+        pos.realized_pnl += pnl
+        pos.shares -= filled
+        if pos.shares <= 1e-12:
+            del self._positions[req.token_id]
+        rec = OrderRecord(
+            client_order_id=req.client_order_id,
+            status=OrderStatus.FILLED,
+            remote_order_id=f"paper-{req.client_order_id}",
+            filled_shares=filled,
+            avg_fill_price=avg_px,
+            remaining=0.0,
+        )
+        self.records[req.client_order_id] = rec
+        return rec
 
     def _apply_buy(self, req: OrderRequest, shares: float, price: float, decision: Decision) -> None:
         pos = self._positions.get(req.token_id)

@@ -22,9 +22,11 @@ from app.monitoring.telegram import Telegram
 from app.portfolio.portfolio import Portfolio
 from app.research.researcher import EvidencePacket, NullResearchProvider, XAISearchProvider
 from app.risk.manager import RiskManager, exposure_from_positions
+from app.risk.regime import RegimeEngine
 from app.storage.db import Database, DatabaseError
 from app.storage.repositories import Repositories
-from app.strategy.evaluator import StrategyEvaluator
+from app.strategy.evaluator import Decision, StrategyEvaluator
+from app.strategy.holding_review import diagnose_holding, thesis_from_decision
 
 BANNER_PAPER = """
 ========================================
@@ -138,6 +140,7 @@ class TradingApp:
         self.executor = Executor(settings, self.repo, self.paper, self.live, self.data)
         self.portfolio = Portfolio(self.paper, self.repo)
         self.risk = RiskManager(settings, self.repo)
+        self.regime = RegimeEngine(settings)
         self.strategy = StrategyEvaluator(settings)
         self.telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
         self.stop = False
@@ -229,25 +232,51 @@ class TradingApp:
             if reason is None:
                 candidates.append(m)
         self.cycle_stats["candidates"] = len(candidates)
-        grok_calls = 0
         marks: dict[str, float] = {}
+        await self._review_holdings(marks)
+        unreal = 0.0
+        for p in self.paper._positions.values():
+            if p.shares <= 0:
+                continue
+            mpx = marks.get(p.token_id, p.avg_price)
+            unreal += p.shares * (mpx - p.avg_price)
+        equity = self.paper.equity(marks)
+        regime = self.regime.update(equity=equity, unrealized_pnl=unreal)
+        self.log.info("REGIME mode=%s reason=%s burn=%.4f", regime.mode, regime.reason, regime.session_ai_cost_usd)
+        prev = getattr(self, "_last_regime_mode", None)
+        if prev != regime.mode:
+            self.repo.event("REGIME", f"{regime.mode} | {regime.reason}", {
+                "mode": regime.mode,
+                "ai_calls": regime.session_ai_calls,
+                "ai_cost": regime.session_ai_cost_usd,
+                "equity": equity,
+            })
+            self._last_regime_mode = regime.mode
+
+        grok_calls = 0
+        max_calls = self.regime.max_ai_calls(regime.mode)
         positions = await self.paper.positions()
-        for m in candidates:
-            if grok_calls >= self.settings.max_grok_calls_per_cycle:
-                break
-            if self.repo.state().halted:
-                break
-            used = await self._consider(m, positions, marks)
-            if used:
-                grok_calls += 1
-            gemini_ready = bool(self.engine and self.engine.gemini)
-            grok_dead = bool(
-                getattr(self.research, "blocked", False)
-                or (self.engine and self.engine.grok and self.engine.grok.blocked)
-            )
-            if grok_dead and not gemini_ready:
-                break
+        if regime.mode != "DIE" and max_calls > 0:
+            for m in candidates:
+                if grok_calls >= max_calls:
+                    break
+                if self.repo.state().halted:
+                    break
+                used = await self._consider(m, positions, marks)
+                if used:
+                    grok_calls += 1
+                    self.regime.note_ai_call(1)
+                gemini_ready = bool(self.engine and self.engine.gemini)
+                grok_dead = bool(
+                    getattr(self.research, "blocked", False)
+                    or (self.engine and self.engine.grok and self.engine.grok.blocked)
+                )
+                if grok_dead and not gemini_ready:
+                    break
         self.portfolio.snapshot(marks)
+        eq = self.paper.equity(marks)
+        self.risk.daily_pnl = eq - self.settings.paper_starting_bankroll
+        self.risk.note_equity(eq, self.settings.paper_starting_bankroll)
         mismatch = await self.paper.reconcile()
         if mismatch:
             self.risk.note_recon_mismatch(mismatch)
@@ -292,6 +321,122 @@ class TradingApp:
             "min_exec_edge": GEMINI_MIN_EXEC_EDGE,
         }
 
+    def _strategy_kwargs(self) -> dict:
+        kw = dict(self._gemini_strategy_kwargs())
+        rk = self.regime.evaluate_kwargs()
+        if not rk:
+            return kw
+        s = self.settings
+        if "min_edge" in rk:
+            kw["min_edge"] = max(kw.get("min_edge", s.min_edge), rk["min_edge"])
+        if "kelly_multiplier" in rk:
+            kw["kelly_multiplier"] = min(
+                kw.get("kelly_multiplier", s.kelly_multiplier),
+                rk["kelly_multiplier"],
+            )
+        return kw
+
+    async def _review_holdings(self, marks: dict[str, float]) -> None:
+        """Diagnose open tickets; paper-SELL when thesis/stop/time says exit."""
+        positions = list(self.paper._positions.values())
+        for pos in positions:
+            if pos.shares <= 1e-12:
+                continue
+            try:
+                book = await self.data.get_order_book(pos.token_id, pos.market_id)
+            except Exception as exc:
+                self.risk.note_api_failure()
+                self.repo.event("API_ERROR", f"holding_book:{exc}")
+                continue
+            if book.best_bid:
+                marks[pos.token_id] = book.best_bid
+            elif book.midpoint:
+                marks[pos.token_id] = book.midpoint
+            row = self.repo.latest_approved_decision(pos.token_id)
+            entry_p, entry_ts = thesis_from_decision(row)
+            verdict = diagnose_holding(
+                shares=pos.shares,
+                avg_price=pos.avg_price,
+                token_id=pos.token_id,
+                market_id=pos.market_id,
+                book=book,
+                entry_p=entry_p,
+                entry_ts=entry_ts,
+                settings=self.settings,
+            )
+            if verdict.reason == "ok":
+                continue
+            stale = filter_book(book, self.settings)
+            if stale and stale != "spread_too_wide":
+                self.repo.event(
+                    "HOLDING_HOLD",
+                    f"{verdict.reason}|{stale}|{pos.token_id[:12]}",
+                    {"reason": verdict.reason, "book": stale},
+                )
+                continue
+            if book.best_bid is None or book.bid_depth_usd() <= 0:
+                continue
+            limit = float(book.best_bid)
+            decision = Decision(
+                approved=True,
+                reject_reason=None,
+                gates=[],
+                market_id=pos.market_id,
+                token_id=pos.token_id,
+                side="SELL",
+                grok_p=entry_p,
+                market_price=limit,
+                size_shares=pos.shares,
+                size_usd=pos.shares * limit,
+                limit_price=limit,
+                category=pos.category,
+                correlation_group=pos.correlation_group,
+            )
+            did = self.repo.insert_decision(
+                {
+                    "market_id": pos.market_id,
+                    "token_id": pos.token_id,
+                    "side": "SELL",
+                    "approved": True,
+                    "reject_reason": None,
+                    "gates": {"exit_reason": {"passed": True, "detail": verdict.reason}},
+                    "grok_p": entry_p,
+                    "market_price": limit,
+                    "raw_edge": verdict.edge_now,
+                    "size_usd": decision.size_usd,
+                    "size_shares": decision.size_shares,
+                    "strategy_version": self.settings.strategy_version,
+                    "prompt_version": self.settings.prompt_version,
+                    "idempotency_key": idempotency_key(
+                        pos.market_id,
+                        pos.token_id,
+                        "SELL",
+                        self.settings.strategy_version,
+                        kind="exit",
+                    ),
+                }
+            )
+            before_pnl = self.paper.realized_pnl
+            err = await self.executor.execute(decision, did, kind="exit")
+            if err:
+                self.repo.event("HOLDING_EXIT_FAIL", f"{verdict.reason}|{err}")
+                continue
+            delta = self.paper.realized_pnl - before_pnl
+            if delta >= 0:
+                self.risk.note_win()
+            else:
+                self.risk.note_loss()
+            self.log.info(
+                "HOLDING_EXIT reason=%s token=%s pnl=%.4f",
+                verdict.reason,
+                pos.token_id[:16],
+                delta,
+            )
+            self.repo.event(
+                "HOLDING_EXIT",
+                f"{verdict.reason} | pnl={delta:.4f}",
+                {"reason": verdict.reason, "detail": verdict.detail, "pnl": delta},
+            )
 
     async def _consider(self, m, positions, marks: dict[str, float]) -> bool:
         if not m.yes_token_id:
@@ -403,7 +548,7 @@ class TradingApp:
         self._mark_books(m, yes_book, no_book, marks)
         exp = exposure_from_positions(positions, marks)
         canary = self.live.authorize_now().allowed
-        gemini_kw = self._gemini_strategy_kwargs()
+        gemini_kw = self._strategy_kwargs()
         for book in (yes_book, no_book):
             if book is None:
                 continue

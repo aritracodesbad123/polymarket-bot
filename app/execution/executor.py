@@ -20,9 +20,17 @@ from app.strategy.evaluator import Decision
 WINDOW_SECONDS = 6 * 60 * 60
 
 
-def idempotency_key(market_id: str, token_id: str, side: str, strategy_version: str, ts: float | None = None) -> str:
+def idempotency_key(
+    market_id: str,
+    token_id: str,
+    side: str,
+    strategy_version: str,
+    ts: float | None = None,
+    *,
+    kind: str = "entry",
+) -> str:
     window = int((ts or time.time()) // WINDOW_SECONDS)
-    raw = f"{market_id}|{token_id}|{side}|{strategy_version}|{window}"
+    raw = f"{market_id}|{token_id}|{side}|{strategy_version}|{window}|{kind}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -47,7 +55,9 @@ class Executor:
             return self.live
         return self.paper
 
-    async def execute(self, decision: Decision, decision_id: int) -> str | None:
+    async def execute(
+        self, decision: Decision, decision_id: int, *, kind: str = "entry"
+    ) -> str | None:
         if not decision.approved or not decision.token_id:
             return "not_approved"
         key = idempotency_key(
@@ -55,6 +65,7 @@ class Executor:
             decision.token_id,
             decision.side or "BUY",
             self.settings.strategy_version,
+            kind=kind,
         )
         existing = self.repo.get_order_by_idempotency(key)
         if existing is not None:

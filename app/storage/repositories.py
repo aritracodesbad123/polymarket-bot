@@ -246,6 +246,14 @@ class Repositories:
             "SELECT * FROM trade_decisions WHERE idempotency_key=?", (key,)
         )
 
+    def latest_approved_decision(self, token_id: str) -> sqlite3.Row | None:
+        return self.db.query_one(
+            """SELECT * FROM trade_decisions
+               WHERE approved=1 AND token_id=?
+               ORDER BY id DESC LIMIT 1""",
+            (token_id,),
+        )
+
     def insert_order(self, row: dict[str, Any]) -> int:
         now = utcnow()
         cur = self.db.execute(
