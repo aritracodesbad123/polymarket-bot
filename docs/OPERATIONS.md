@@ -48,6 +48,7 @@ Set exactly:
 ```bash
 DB_PATH=polygrok-week2-5000.db
 PAPER_STARTING_BANKROLL=5000
+KILL_FLOOR_PCT=0.10
 API_DIE_CUSHION_USD=0
 WEEKLY_LOSS_PCT=0.05
 MAX_POSITION_USD=25
@@ -55,9 +56,18 @@ MAX_TOTAL_EXPOSURE_USD=500
 MAX_DAILY_LOSS_USD=50
 ```
 
-Leave `ESTIMATED_USD_PER_AI_CALL`, `MIN_EDGE`, `MAX_SPREAD`, `KILL_FLOOR_PCT` (0.20), and `MAX_DAILY_LOSS_PCT` at their current values unless you mean to change them. `WEEKLY_LOSS_PCT=0.05` is a 5% stop against the persisted week-start equity (baseline 5000 → halt/DIE at 4750). That is separate from the 20% kill floor (equity vs starting bankroll) and from the daily loss rule.
+Two equity stops, both on a $5,000 start:
+
+| Control | Env | Trips when |
+|---|---|---|
+| Catastrophic kill floor | `KILL_FLOOR_PCT=0.10` | equity <= **$4,500** (10% of starting bankroll). Regime DIE `kill_floor`. |
+| Weekly stop | `WEEKLY_LOSS_PCT=0.05` | equity <= **$4,750** when the week baseline is $5,000 (5% of that baseline). Regime DIE `weekly_equity_stop` and HALTED. |
+
+The kill floor is measured against starting bankroll. The weekly stop is measured against the persisted week-start baseline. The daily loss rule is separate again: percentage `MAX_DAILY_LOSS_PCT` plus absolute `MAX_DAILY_LOSS_USD=50`, stricter one wins.
 
 `API_DIE_CUSHION_USD=0` makes the cost DIE rule `burn > 0 and burn >= profit`. Zero burn and zero profit at startup does not DIE. The first paid call can.
+
+Leave `ESTIMATED_USD_PER_AI_CALL`, `MIN_EDGE`, and `MAX_SPREAD` at their current values. The code default for `KILL_FLOOR_PCT` remains 0.20; this cohort overrides it to 0.10.
 
 Week boundary is Monday 00:00 UTC. The baseline is the equity at the first cycle of that week and is stored in `system_state`. It resets only on that boundary or via `python -m app.cli reset-week-baseline` (does not clear HALTED). `resume-paper` does not move it.
 

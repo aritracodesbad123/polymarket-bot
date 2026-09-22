@@ -238,6 +238,29 @@ def test_weekly_stop_distinct_from_kill_floor_and_persists(tmp_path):
     assert repo.week_baseline_state()[1] == pytest.approx(5000.0)
 
 
+def test_cohort_kill_floor_4500_and_weekly_stop_4750(tmp_path):
+    """$5,000 cohort lines: KILL_FLOOR_PCT=0.10 at 4500, weekly stop at 4750."""
+    _d, repo = db(tmp_path)
+    s = _settings(
+        paper_starting_bankroll=5000.0,
+        kill_floor_pct=0.10,
+        weekly_loss_pct=0.05,
+        api_die_cushion_usd=0.0,
+    )
+    eng = RegimeEngine(s, repo)
+    assert eng.update(equity=5000.0, unrealized_pnl=0.0).mode == "ATTACK"
+    assert eng.update(equity=4800.0, unrealized_pnl=0.0).mode != "DIE"
+    weekly = eng.update(equity=4750.0, unrealized_pnl=0.0)
+    assert weekly.mode == "DIE"
+    assert weekly.reason.startswith("weekly_equity_stop")
+    assert "kill_floor" not in weekly.reason
+    assert repo.state().halt_reason.startswith("weekly_equity_stop")
+    catastrophic = eng.update(equity=4500.0, unrealized_pnl=0.0)
+    assert catastrophic.mode == "DIE"
+    assert catastrophic.reason.startswith("kill_floor")
+    assert "4500.00" in catastrophic.reason
+
+
 def test_kill_floor_still_fires_and_is_not_a_halt_without_weekly(tmp_path):
     _d, repo = db(tmp_path)
     eng = RegimeEngine(_settings(), repo)
