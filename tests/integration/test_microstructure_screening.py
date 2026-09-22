@@ -48,10 +48,25 @@ def _budget_settings(tmp_path, **kw):
     return settings(tmp_path, **base)
 
 
-def _wire(app: TradingApp, *, bid: float = 0.38, ask: float = 0.40) -> dict[str, int]:
+def _wire(
+    app: TradingApp,
+    *,
+    bid: float = 0.38,
+    ask: float = 0.40,
+    bid_size: float = 8_000.0,
+    ask_size: float = 2_000.0,
+) -> dict[str, int]:
     calls = {"scan": 0}
-    yes = book(token_id="yes1", bid=bid, ask=ask)
-    no = book(token_id="no1", bid=round(1.0 - ask, 2), ask=round(1.0 - bid, 2))
+    # |I| = 0.60 so Phase 1 does not reject micro_weak_imbalance before the
+    # Survival edge gate. Equal top sizes are covered separately.
+    yes = book(token_id="yes1", bid=bid, ask=ask, bid_size=bid_size, ask_size=ask_size)
+    no = book(
+        token_id="no1",
+        bid=round(1.0 - ask, 2),
+        ask=round(1.0 - bid, 2),
+        bid_size=ask_size,
+        ask_size=bid_size,
+    )
 
     async def scan():
         calls["scan"] += 1
@@ -98,6 +113,9 @@ async def test_budget_die_screens_via_micro_and_logs_provider(tmp_path, caplog):
     assert events[0]["message"] == "provider=micro"
     payload = json.loads(events[0]["payload_json"])
     assert payload["provider"] == MICRO_PROVIDER
+    assert payload["imbalance"] == pytest.approx(0.6)
+    assert payload["lambda"] == pytest.approx(0.04)
+    assert payload["microprice"] is not None
     preds = app.repo.db.query(
         "SELECT model, should_abstain, confidence_score FROM ai_predictions"
     )
@@ -124,6 +142,36 @@ async def test_budget_die_screens_via_micro_and_logs_provider(tmp_path, caplog):
     assert "kelly_multiplier" not in kw
     assert GEMINI_KELLY_MULTIPLIER == 0.125
     assert not app.repo.state().halted
+
+
+@pytest.mark.asyncio
+async def test_balanced_book_rejects_weak_imbalance(tmp_path):
+    app = TradingApp(
+        _budget_settings(
+            tmp_path,
+            estimator="microstructure",
+            db_path=str(tmp_path / "balanced.db"),
+        )
+    )
+    app.engine = _Engine()
+    app.research = _Research()
+    calls = _wire(app, bid_size=2_000, ask_size=2_000)
+    app.regime.note_ai_call(10)
+    await app.cycle()
+    assert calls["scan"] == 1
+    assert app.engine.calls == 0
+    assert app.repo.db.query("SELECT id FROM ai_predictions") == []
+    row = app.repo.db.query_one("SELECT reject_reason, gates_json FROM trade_decisions")
+    assert row["reject_reason"] == "micro_weak_imbalance"
+    gates = json.loads(row["gates_json"])
+    assert gates["ai_provider"]["detail"] == "micro"
+    event = app.repo.db.query_one(
+        "SELECT payload_json FROM system_events WHERE kind='AI_ESTIMATE'"
+    )
+    payload = json.loads(event["payload_json"])
+    assert payload["imbalance"] == pytest.approx(0.0)
+    assert payload["microprice"] is not None
+    assert payload["fair"] is not None
 
 
 @pytest.mark.asyncio

@@ -112,6 +112,10 @@ class Settings(BaseModel):
     # ``microstructure`` arms the non-LLM book estimator after the session
     # budget stops screening. Unset (or any other value) keeps the burn-stop.
     estimator: str | None = None
+    # Phase 1 book fair: clip(mid + λ × imbalance, 0.01, 0.99). Not a Survival gate.
+    micro_lambda: float = 0.04
+    # Reject microstructure quotes with a weaker absolute imbalance.
+    micro_min_abs_imbalance: float = 0.40
     # DEFEND band only: equity under start by this much, unrealized worse than
     # -this, or burn past half of (profit + this). <=0 turns the band off.
     # It is not the session spend cap.
@@ -204,6 +208,8 @@ class Settings(BaseModel):
             estimated_usd_per_ai_call=_f("ESTIMATED_USD_PER_AI_CALL", 0.02),
             ai_session_budget_usd=_f("AI_SESSION_BUDGET_USD", 10.0),
             estimator=_s("ESTIMATOR", "").lower() or None,
+            micro_lambda=_f("MICRO_LAMBDA", 0.04),
+            micro_min_abs_imbalance=_f("MICRO_MIN_ABS_I", 0.40),
             api_die_cushion_usd=_f("API_DIE_CUSHION_USD", 0.50),
             defend_edge_tighten=_f("DEFEND_EDGE_TIGHTEN", 0.02),
             defend_kelly_mult=_f("DEFEND_KELLY_MULT", 0.5),

@@ -160,6 +160,12 @@ class TradingApp:
             max_spread=settings.max_spread,
             min_confidence=max(settings.min_confidence_score, MICRO_MIN_CONFIDENCE),
             min_liquidity=settings.min_liquidity,
+            lam=settings.micro_lambda,
+            min_abs_imbalance=settings.micro_min_abs_imbalance,
+            bankroll=settings.paper_starting_bankroll,
+            kelly_multiplier=settings.kelly_multiplier,
+            max_position_usd=settings.max_position_usd,
+            max_position_pct_bankroll=settings.max_position_pct_bankroll,
         )
         # Test switch. Production uses ESTIMATOR=microstructure, which turns
         # the book estimator on only after the AI budget stops screening.
@@ -377,11 +383,15 @@ class TradingApp:
     def _log_micro(self, market, result: MicrostructureResult) -> None:
         fair = result.fair
         conf = result.confidence_score
+        imb = result.imbalance
+        m_star = result.microprice
         self.log.info(
-            "ESTIMATE provider=%s market=%s fair=%s conf=%s buy_edge=%s sell_edge=%s reject=%s",
+            "ESTIMATE provider=%s market=%s fair=%s I=%s m*=%s conf=%s buy_edge=%s sell_edge=%s reject=%s",
             MICRO_PROVIDER,
             market.market_id,
             f"{fair:.4f}" if fair is not None else "none",
+            f"{imb:.4f}" if imb is not None else "none",
+            f"{m_star:.4f}" if m_star is not None else "none",
             f"{conf:.3f}" if conf is not None else "none",
             f"{result.buy_yes_edge:.4f}" if result.buy_yes_edge is not None else "none",
             f"{result.sell_no_edge:.4f}" if result.sell_no_edge is not None else "none",
@@ -658,6 +668,9 @@ class TradingApp:
                 category=m.category or "other",
                 min_edge=kw.get("min_edge", self.settings.min_edge),
                 min_confidence=self._micro_confidence_floor(),
+                bankroll=self.settings.paper_starting_bankroll,
+                cash=self.paper.cash,
+                kelly_multiplier=kw.get("kelly_multiplier", self.settings.kelly_multiplier),
             )
             self._log_micro(m, micro_result)
             if micro_result.reject_reason or micro_result.estimate is None:
