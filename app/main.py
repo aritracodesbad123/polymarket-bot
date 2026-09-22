@@ -34,7 +34,13 @@ from app.monitoring.telegram import Telegram
 from app.portfolio.portfolio import Portfolio
 from app.research.researcher import EvidencePacket, NullResearchProvider, XAISearchProvider
 from app.risk.manager import RiskManager, exposure_from_positions
-from app.risk.regime import RegimeEngine, RegimeState, ai_spend_blocked_screening, new_screening_allowed
+from app.risk.regime import (
+    RegimeEngine,
+    RegimeState,
+    estimator_switch_reason,
+    new_screening_allowed,
+    screening_path,
+)
 from app.storage.db import Database, DatabaseError
 from app.storage.repositories import Repositories
 from app.strategy.evaluator import Decision, StrategyEvaluator
@@ -170,6 +176,7 @@ class TradingApp:
         # Test switch. Production uses ESTIMATOR=microstructure, which turns
         # the book estimator on only after the AI budget stops screening.
         self.force_microstructure = False
+        self._last_screening_path: str | None = None
         self.telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
         self.stop = False
         self.cycle_stats = {
@@ -231,6 +238,8 @@ class TradingApp:
         # Exits stay on this path. Session-budget DIE and the post-fill
         # screening stop skip new AI calls. ESTIMATOR=microstructure keeps
         # the scan on that path and prices the book instead of calling an LLM.
+        # With ESTIMATOR_AUTO_SWITCH (default ON), post-fill flips LLM↔micro
+        # on daily realized PnL vs burn; open tickets still exit on either path.
         marks: dict[str, float] = {}
         await self._review_holdings(marks)
         unreal = 0.0
@@ -240,12 +249,18 @@ class TradingApp:
             mpx = marks.get(p.token_id, p.avg_price)
             unreal += p.shares * (mpx - p.avg_price)
         equity = self.paper.equity(marks)
-        regime = self.regime.update(equity=equity, unrealized_pnl=unreal)
+        realized = self.risk.daily_realized_pnl
+        regime = self.regime.update(
+            equity=equity,
+            unrealized_pnl=unreal,
+            realized_pnl=realized,
+        )
         self.log.info(
-            "REGIME mode=%s reason=%s burn=%.4f screening=%s fills=%s",
+            "REGIME mode=%s reason=%s burn=%.4f realized=%.4f screening=%s fills=%s",
             regime.mode,
             regime.reason,
             regime.session_ai_cost_usd,
+            realized,
             regime.screening_allowed,
             regime.has_taken_fills,
         )
@@ -256,14 +271,19 @@ class TradingApp:
                 "ai_calls": regime.session_ai_calls,
                 "ai_cost": regime.session_ai_cost_usd,
                 "equity": equity,
+                "realized_pnl": realized,
                 "screening_allowed": regime.screening_allowed,
                 "has_taken_fills": regime.has_taken_fills,
             })
             self._last_regime_mode = regime.mode
             self._last_screening = regime.screening_allowed
 
-        micro = self._microstructure_active(regime)
-        if new_screening_allowed(regime) or micro:
+        path = screening_path(
+            regime, self.settings, force_micro=self.force_microstructure
+        )
+        self._log_estimator_switch(path, regime, realized)
+        micro = path == "micro"
+        if path in ("llm", "micro"):
             if micro and not new_screening_allowed(regime):
                 self.log.info(
                     "SCREEN provider=%s reason=%s",
@@ -411,17 +431,47 @@ class TradingApp:
         """
         self.force_microstructure = True
 
+    def _log_estimator_switch(
+        self, path: str, regime: RegimeState, realized: float
+    ) -> None:
+        prev = self._last_screening_path
+        if prev == path:
+            return
+        reason = estimator_switch_reason(regime, path)
+        provider = (
+            MICRO_PROVIDER
+            if path == "micro"
+            else (self._provider_tag() if path == "llm" else "none")
+        )
+        msg = (
+            f"ESTIMATOR_SWITCH from={prev or 'init'} to={path} "
+            f"provider={provider} reason={reason} "
+            f"burn={regime.session_ai_cost_usd:.4f} realized={realized:.4f}"
+        )
+        self.log.info(msg)
+        self.repo.event(
+            "ESTIMATOR_SWITCH",
+            msg,
+            {
+                "from": prev or "init",
+                "to": path,
+                "provider": provider,
+                "reason": reason,
+                "burn": regime.session_ai_cost_usd,
+                "realized_pnl": realized,
+                "regime_reason": regime.reason,
+            },
+        )
+        self._last_screening_path = path
+
     def _microstructure_active(self, regime: RegimeState | None = None) -> bool:
         """Price the book instead of calling an LLM. Does not loosen stops."""
         if self.force_microstructure:
             return True
-        name = (self.settings.estimator or "").strip().lower()
-        if name != "microstructure":
-            return False
         st = self.regime.last if regime is None else regime
         if st is None:
             return False
-        return ai_spend_blocked_screening(st)
+        return screening_path(st, self.settings) == "micro"
 
     def _micro_confidence_floor(self) -> float:
         return max(self.settings.min_confidence_score, MICRO_MIN_CONFIDENCE)

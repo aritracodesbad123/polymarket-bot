@@ -56,8 +56,10 @@ def test_tradeable_mid_from_env(monkeypatch, tmp_path):
 
 def test_estimator_from_env(monkeypatch, tmp_path):
     monkeypatch.delenv("ESTIMATOR", raising=False)
+    monkeypatch.delenv("ESTIMATOR_AUTO_SWITCH", raising=False)
     blank = Settings.from_env(dotenv_path=tmp_path / "none.env")
     assert blank.estimator is None
+    assert blank.estimator_auto_switch is True
 
     monkeypatch.setenv("ESTIMATOR", "")
     empty = Settings.from_env(dotenv_path=tmp_path / "none.env")
@@ -66,10 +68,17 @@ def test_estimator_from_env(monkeypatch, tmp_path):
     monkeypatch.setenv("ESTIMATOR", "microstructure")
     armed = Settings.from_env(dotenv_path=tmp_path / "none.env")
     assert armed.estimator == "microstructure"
+    assert armed.estimator_auto_switch is True
 
     monkeypatch.setenv("ESTIMATOR", "OFF")
     off = Settings.from_env(dotenv_path=tmp_path / "none.env")
     assert off.estimator == "off"
+
+    monkeypatch.setenv("ESTIMATOR", "microstructure")
+    monkeypatch.setenv("ESTIMATOR_AUTO_SWITCH", "0")
+    disabled = Settings.from_env(dotenv_path=tmp_path / "none.env")
+    assert disabled.estimator == "microstructure"
+    assert disabled.estimator_auto_switch is False
 
 
 def test_micro_phase1_env(monkeypatch, tmp_path):
