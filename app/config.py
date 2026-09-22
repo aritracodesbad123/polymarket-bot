@@ -84,6 +84,10 @@ class Settings(BaseModel):
     min_liquidity: float = 500.0
     min_volume: float = 2000.0
     max_spread: float = 0.06
+    # Fresh book mid must sit in this band before an AI estimate. Edges are
+    # tradeable. Outside it, the loop rejects mid_outside_band and does not spend.
+    min_tradeable_mid: float = 0.10
+    max_tradeable_mid: float = 0.90
     min_time_to_resolution_hours: float = 6.0
     max_time_to_resolution_hours: float = 720.0
     max_markets_per_cycle: int = 50
@@ -178,6 +182,8 @@ class Settings(BaseModel):
             min_liquidity=_f("MIN_LIQUIDITY", 500.0),
             min_volume=_f("MIN_VOLUME", 2000.0),
             max_spread=_f("MAX_SPREAD", 0.06),
+            min_tradeable_mid=_f("MIN_TRADEABLE_MID", 0.10),
+            max_tradeable_mid=_f("MAX_TRADEABLE_MID", 0.90),
             min_time_to_resolution_hours=_f("MIN_TIME_TO_RESOLUTION_HOURS", 6.0),
             max_time_to_resolution_hours=_f("MAX_TIME_TO_RESOLUTION_HOURS", 720.0),
             max_markets_per_cycle=_i("MAX_MARKETS_PER_CYCLE", 50),

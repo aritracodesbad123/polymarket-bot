@@ -241,7 +241,14 @@ def soft_hard(reason: str | None) -> str:
         "low_confidence",
         "stale_data",
     )
-    hard = ("spread_too_wide", "edge_too_small", "kill", "halt", "daily_loss")
+    hard = (
+        "spread_too_wide",
+        "edge_too_small",
+        "mid_outside_band",
+        "kill",
+        "halt",
+        "daily_loss",
+    )
     if any(s in r for s in soft) or r.startswith("gemini_error"):
         return "soft_ai"
     if any(h in r for h in hard):
@@ -751,10 +758,26 @@ def build_snapshot() -> dict[str, Any]:
             grok_n += 1
         elif "gemini" in prov:
             gemini_n += 1
-        # rough funnel
-        if nr not in ("research_failed", "gemini_cooldown", "gemini_cascade_exhausted", "gemini_error", "grok_abstain"):
+        # rough funnel. mid_outside_band is pre-AI: the model was not called.
+        if nr not in (
+            "research_failed",
+            "gemini_cooldown",
+            "gemini_cascade_exhausted",
+            "gemini_error",
+            "grok_abstain",
+            "mid_outside_band",
+        ):
             funnel["estimates_ok"] += 1
-        if nr not in ("research_failed", "gemini_cooldown", "gemini_cascade_exhausted", "gemini_error", "grok_abstain", "edge_too_small", "low_confidence"):
+        if nr not in (
+            "research_failed",
+            "gemini_cooldown",
+            "gemini_cascade_exhausted",
+            "gemini_error",
+            "grok_abstain",
+            "mid_outside_band",
+            "edge_too_small",
+            "low_confidence",
+        ):
             funnel["edge_pass"] += 1
         if d["approved"]:
             funnel["size_pass"] += 1

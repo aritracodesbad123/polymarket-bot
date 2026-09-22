@@ -68,6 +68,23 @@ def filter_book(book: OrderBook, settings: Settings, now=None) -> str | None:
     return None
 
 
+# Pre-AI reject. Same string in trade_decisions.reject_reason and system_events.
+MID_OUTSIDE_BAND = "mid_outside_band"
+
+
+def filter_tradeable_mid(mid: float | None, settings: Settings) -> str | None:
+    """Skip the model when the book mid is outside the tradeable band.
+
+    Edges are tradeable: ``min_tradeable_mid <= mid <= max_tradeable_mid``
+    (defaults 0.10 and 0.90). A missing mid is not tradeable.
+    """
+    lo = settings.min_tradeable_mid
+    hi = settings.max_tradeable_mid
+    if mid is None or mid < lo or mid > hi:
+        return MID_OUTSIDE_BAND
+    return None
+
+
 class MarketScanner:
     def __init__(self, client: PolymarketClient, settings: Settings) -> None:
         self.client = client

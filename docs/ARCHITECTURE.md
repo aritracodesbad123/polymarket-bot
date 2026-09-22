@@ -4,11 +4,13 @@ Grok estimates. Python decides. Risk constrains. Execution trades.
 The operator unlocks live. No per-trade approval.
 
 ```
-MarketScanner → ResearchProvider → GrokProbabilityEngine
+MarketScanner → book mid band → ResearchProvider → GrokProbabilityEngine
     → StrategyEngine → RiskEngine → ExecutionEngine → Broker
                                               ├─ PaperBroker
                                               └─ LiveBroker (locked)
 ```
+
+A fresh book mid outside `[MIN_TRADEABLE_MID, MAX_TRADEABLE_MID]` (default 0.10–0.90, edges included) is `mid_outside_band` before research or the probability engine, so it does not spend an AI call.
 
 ## Layers
 

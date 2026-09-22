@@ -16,7 +16,13 @@ from app.config import Settings
 from app.evaluation.reports import daily_report
 from app.execution.executor import Executor, idempotency_key
 from app.market_data.client import PolymarketClient
-from app.market_data.scanner import MarketScanner, filter_book, filter_market
+from app.market_data.scanner import (
+    MID_OUTSIDE_BAND,
+    MarketScanner,
+    filter_book,
+    filter_market,
+    filter_tradeable_mid,
+)
 from app.monitoring.logging import setup_logging
 from app.monitoring.telegram import Telegram
 from app.portfolio.portfolio import Portfolio
@@ -524,6 +530,21 @@ class TradingApp:
                 "best_ask": yes_book.best_ask,
             },
         )
+        # Fresh book mid is in. Lottery / near-certain books never reach research
+        # or engine.estimate, and _consider returns False so the session burn
+        # counter does not move.
+        mid_reject = filter_tradeable_mid(yes_book.midpoint, self.settings)
+        if mid_reject:
+            self._reject(
+                m,
+                mid_reject,
+                extra={
+                    "mid": yes_book.midpoint,
+                    "min_tradeable_mid": self.settings.min_tradeable_mid,
+                    "max_tradeable_mid": self.settings.max_tradeable_mid,
+                },
+            )
+            return False
         packet = EvidencePacket(
             market_id=m.market_id,
             question=m.question,
@@ -705,6 +726,12 @@ class TradingApp:
         detail = ""
         if reason == "spread_too_wide" and extra.get("spread") is not None:
             detail = f"spread={float(extra['spread']):.4f} max={float(extra.get('max_spread', self.settings.max_spread)):.4f}"
+        elif reason == MID_OUTSIDE_BAND:
+            mid = extra.get("mid")
+            lo = extra.get("min_tradeable_mid", self.settings.min_tradeable_mid)
+            hi = extra.get("max_tradeable_mid", self.settings.max_tradeable_mid)
+            shown = "none" if mid is None else f"{float(mid):.4f}"
+            detail = f"mid={shown} band=[{float(lo):.4f},{float(hi):.4f}]"
         ident = self._market_identity(m)
         gates = {
             reason: {"passed": False, "detail": detail},
