@@ -13,7 +13,12 @@ from app.broker.paper import PaperBroker
 from app.config import Settings
 from app.market_data.client import PolymarketClient
 from app.market_data.scanner import filter_book
-from app.risk.caps import position_notional_cap, total_exposure_cap
+from app.risk.caps import (
+    add_breaches_cap,
+    position_cost_from_rows,
+    position_notional_cap,
+    total_exposure_cap,
+)
 from app.storage.repositories import Repositories
 from app.strategy.evaluator import Decision
 
@@ -95,12 +100,15 @@ class Executor:
             notional = req.price * req.size_shares
             bankroll = self.settings.paper_starting_bankroll
             pos_cap = position_notional_cap(self.settings, bankroll)
-            if notional > pos_cap + 1e-4:
+            # Cost basis of this token, plus resting BUY reserve. Unknown
+            # inventory fails closed — do not add onto a book we cannot see.
+            committed = await self._token_commitment(broker, req.token_id)
+            if committed is None or add_breaches_cap(committed, notional, pos_cap):
                 return "position_usd_cap"
             exposure_fn = getattr(broker, "exposure", None)
             if callable(exposure_fn):
                 exp_cap = total_exposure_cap(self.settings, bankroll)
-                if float(exposure_fn()) + notional > exp_cap + 1e-4:
+                if add_breaches_cap(float(exposure_fn()), notional, exp_cap):
                     return "exposure_usd_cap"
         oid = self.repo.insert_order(
             {
@@ -151,3 +159,21 @@ class Executor:
         kind = "PAPER_ORDER" if broker.name == "paper" else "LIVE_ORDER"
         self.repo.event(kind, rec.status.value, {"client_order_id": cid})
         return None
+
+    async def _token_commitment(self, broker, token_id: str) -> float | None:
+        """Open cost basis plus resting BUY notional for ``token_id``.
+
+        None when inventory cannot be read (fail closed at the caller).
+        """
+        try:
+            rows = await broker.positions()
+        except Exception:
+            return None
+        cost = position_cost_from_rows(rows, token_id)
+        reserve = getattr(broker, "resting_buy_usd", None)
+        if not callable(reserve):
+            return cost
+        try:
+            return cost + float(reserve(token_id))
+        except Exception:
+            return None

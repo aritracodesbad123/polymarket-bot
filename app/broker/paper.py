@@ -64,6 +64,16 @@ class PaperBroker:
             inv += p.shares * px
         return self.cash + self.reserved + inv
 
+    def resting_buy_usd(self, token_id: str) -> float:
+        """Unfilled BUY reserve on ``token_id`` (remaining shares × limit)."""
+        total = 0.0
+        for rest in self.resting.values():
+            req = rest.req
+            if req.token_id != token_id or req.side.upper() != "BUY":
+                continue
+            total += max(0.0, rest.remaining) * max(0.0, req.price)
+        return total
+
     def exposure(self, marks: dict[str, float] | None = None) -> float:
         marks = marks or {}
         tot = 0.0

@@ -190,6 +190,9 @@ class TimeoutBroker:
     def operational(self) -> bool:
         return True
 
+    async def positions(self):
+        return []
+
     async def submit(self, *a, **k):
         raise TimeoutError("post timeout")
 
