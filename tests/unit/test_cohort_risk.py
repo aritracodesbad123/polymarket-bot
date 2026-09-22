@@ -620,6 +620,7 @@ async def test_executor_enforces_absolute_caps(tmp_path):
 
 
 def test_optional_caps_from_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("KILL_FLOOR_PCT", raising=False)
     monkeypatch.setenv("MAX_POSITION_USD", "25")
     monkeypatch.setenv("MAX_TOTAL_EXPOSURE_USD", "500")
     monkeypatch.setenv("MAX_DAILY_LOSS_USD", "50")
