@@ -56,7 +56,7 @@ python -m app.cli run
 | `MIN_TRADEABLE_MID` / `MAX_TRADEABLE_MID` | Skip the AI estimate when the book mid is outside this band. Defaults `0.10` / `0.90`; edges are tradeable. Reject reason `mid_outside_band`. |
 | `ESTIMATOR` | `microstructure` keeps screening with a book estimator after the AI budget stops. Unset keeps the burn-stop. |
 | `ESTIMATOR_AUTO_SWITCH` | With `ESTIMATOR=microstructure`, default `1`: flip LLM↔micro on daily realized PnL vs burn. `0` = micro-after-stop only. |
-| `MICRO_LAMBDA` / `MICRO_MIN_ABS_I` | Phase 1b fair shift λ times imbalance (default `0.08`) and minimum absolute imbalance (default `0.40`). |
+| `MICRO_LAMBDA` / `MICRO_MIN_ABS_I` | Phase 1b fair shift λ times imbalance (default `0.08`) and minimum absolute imbalance (default `0.55`). |
 | `MICRO_COIN_FLIP_MIN` / `MICRO_COIN_FLIP_MAX` | Micro-only: reject new entries when book mid is in this inclusive band (defaults `0.45` / `0.55`). Reason `micro_coin_flip_mid`. Gemini/LLM path unchanged. |
 | `TRADING_MODE` | `paper` (default) or `live` (still needs full unlock AND-gate) |
 | `LIVE_TRADING_ENABLED` | Must be `true` **and** activation phrase logged to unlock live |

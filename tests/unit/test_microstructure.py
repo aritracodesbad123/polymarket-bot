@@ -125,7 +125,7 @@ def test_crossed_or_missing_quote_fails_closed():
 
 
 def test_weak_imbalance_rejects_and_boundary_passes():
-    assert MICRO_MIN_ABS_I == 0.40
+    assert MICRO_MIN_ABS_I == 0.55
     mild = OrderBook(
         token_id="yes1",
         market_id="m1",
@@ -144,14 +144,14 @@ def test_weak_imbalance_rejects_and_boundary_passes():
     # The quote was real, so it still enters the stability window.
     assert len(est.snapshots("m1")) == 1
 
-    # |I| == 0.40 is enough. A hair under is not.
+    # |I| == 0.55 is enough. A hair under is not.
     at_floor = OrderBook(
         token_id="yes1",
         market_id="m-floor",
-        bids=[BookLevel(price=0.40, size=7_000)],
-        asks=[BookLevel(price=0.42, size=3_000)],
+        bids=[BookLevel(price=0.40, size=7_750)],
+        asks=[BookLevel(price=0.42, size=2_250)],
     )
-    assert imbalance(7_000, 3_000) == pytest.approx(0.40)
+    assert imbalance(7_750, 2_250) == pytest.approx(0.55)
     held = est.estimate(at_floor, market_id="m-floor", category="politics")
     assert held.reject_reason is None
     assert held.estimate is not None
@@ -159,10 +159,10 @@ def test_weak_imbalance_rejects_and_boundary_passes():
     under = OrderBook(
         token_id="yes1",
         market_id="m-under",
-        bids=[BookLevel(price=0.40, size=6_990)],
-        asks=[BookLevel(price=0.42, size=3_010)],
+        bids=[BookLevel(price=0.40, size=7_740)],
+        asks=[BookLevel(price=0.42, size=2_260)],
     )
-    assert abs(imbalance(6_990, 3_010)) < 0.40
+    assert abs(imbalance(7_740, 2_260)) < 0.55
     weak = est.estimate(under, market_id="m-under", category="politics")
     assert weak.reject_reason == "micro_weak_imbalance"
 
@@ -322,7 +322,7 @@ def test_estimator_confidence_edge_and_snapshot_window():
     assert len(est.snapshots("m2")) == 1
     assert other.stability == 0.0
 
-    # Floor cannot be cut below 0.50. A thin top with |I| >= 0.40 still abstains.
+    # Floor cannot be cut below 0.50. A thin top with |I| >= 0.55 still abstains.
     thin = OrderBook(
         token_id="yes1",
         market_id="m-thin",
@@ -541,7 +541,7 @@ def test_thin_touch_uses_position_proxy_and_kelly_size():
         min_liquidity=1.0,
     )
     sold = kelly_est.estimate(sell_book, market_id="m-sell", category="geopolitics")
-    assert sold.imbalance is not None and sold.imbalance < -0.40
+    assert sold.imbalance is not None and sold.imbalance < -MICRO_MIN_ABS_I
     assert sold.side == "SELL_NO"
     assert sold.fair is not None
     no_p = 1.0 - sold.fair
