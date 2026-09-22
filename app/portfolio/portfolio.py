@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.broker.paper import PaperBroker
+from app.broker.paper import PaperBroker, PaperPosition
 from app.storage.repositories import Repositories
 
 
@@ -38,3 +38,31 @@ class Portfolio:
                     }
                 )
         return snap
+
+    def hydrate_paper(self, starting_bankroll: float) -> None:
+        """Restore cash and open positions from the latest snapshot.
+
+        No snapshot leaves the broker at ``starting_bankroll`` (new database).
+        Does not write. Positions are loaded only together with that snapshot's
+        cash so equity is not double-counted.
+        """
+        if starting_bankroll < 0:
+            raise ValueError("starting_bankroll")
+        snap = self.repo.latest_portfolio()
+        if snap is None:
+            return
+        self.paper.cash = float(snap["cash"])
+        self.paper.reserved = float(snap["reserved_cash"] or 0.0)
+        self.paper.realized_pnl = float(snap["realized_pnl"] or 0.0)
+        self.paper._positions.clear()
+        for row in self.repo.positions():
+            token = row["token_id"]
+            self.paper._positions[token] = PaperPosition(
+                token_id=token,
+                market_id=row["market_id"] or "",
+                shares=float(row["shares"]),
+                avg_price=float(row["avg_price"]),
+                realized_pnl=float(row["realized_pnl"] or 0.0),
+                category=row["category"] or "",
+                correlation_group=row["correlation_group"] or "",
+            )

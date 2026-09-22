@@ -21,6 +21,14 @@ def _f(name: str, default: float) -> float:
     return default if raw is None or raw == "" else float(raw)
 
 
+def _opt_f(name: str) -> float | None:
+    """Unset or blank → None (feature off). Explicit 0 is a real value."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return float(raw.strip())
+
+
 def _i(name: str, default: int) -> int:
     raw = os.environ.get(name)
     return default if raw is None or raw == "" else int(raw)
@@ -66,6 +74,10 @@ class Settings(BaseModel):
     max_correlation_group_exposure_pct: float = 0.10
     max_slippage_pct: float = 0.02
     max_daily_loss_pct: float = 0.05
+    # Optional absolute USD caps. None preserves percentage-only behavior.
+    max_position_usd: float | None = None
+    max_total_exposure_usd: float | None = None
+    max_daily_loss_usd: float | None = None
     max_consecutive_losses: int = 5
     min_liquidity_multiple: float = 3.0
 
@@ -94,7 +106,10 @@ class Settings(BaseModel):
     defend_edge_tighten: float = 0.02
     defend_kelly_mult: float = 0.5
     defend_max_grok_calls: int = 3
-    kill_floor_pct: float = 0.20  # DIE if equity <= start * (1 - this)
+    kill_floor_pct: float = 0.20  # DIE if equity <= start * (1 - this). Not the weekly stop.
+    # Weekly equity stop vs the persisted week-start baseline. None/<=0 = off.
+    # Distinct from kill_floor_pct (catastrophic, vs starting bankroll) and max_daily_loss_pct.
+    weekly_loss_pct: float | None = None
 
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
@@ -149,6 +164,9 @@ class Settings(BaseModel):
             ),
             max_slippage_pct=_f("MAX_SLIPPAGE_PCT", 0.02),
             max_daily_loss_pct=_f("MAX_DAILY_LOSS_PCT", 0.05),
+            max_position_usd=_opt_f("MAX_POSITION_USD"),
+            max_total_exposure_usd=_opt_f("MAX_TOTAL_EXPOSURE_USD"),
+            max_daily_loss_usd=_opt_f("MAX_DAILY_LOSS_USD"),
             max_consecutive_losses=_i("MAX_CONSECUTIVE_LOSSES", 5),
             min_liquidity_multiple=_f("MIN_LIQUIDITY_MULTIPLE", 3.0),
             min_liquidity=_f("MIN_LIQUIDITY", 500.0),
@@ -174,6 +192,7 @@ class Settings(BaseModel):
             defend_kelly_mult=_f("DEFEND_KELLY_MULT", 0.5),
             defend_max_grok_calls=_i("DEFEND_MAX_GROK_CALLS", 3),
             kill_floor_pct=_f("KILL_FLOOR_PCT", 0.20),
+            weekly_loss_pct=_opt_f("WEEKLY_LOSS_PCT"),
             telegram_bot_token=tg_token,
             telegram_chat_id=tg_chat,
             market_blacklist=blacklist,

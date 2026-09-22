@@ -13,6 +13,7 @@ from app.broker.paper import PaperBroker
 from app.config import Settings
 from app.market_data.client import PolymarketClient
 from app.market_data.scanner import filter_book
+from app.risk.caps import position_notional_cap, total_exposure_cap
 from app.storage.repositories import Repositories
 from app.strategy.evaluator import Decision
 
@@ -90,6 +91,17 @@ class Executor:
             decision_id=decision_id,
         )
         broker = self._broker()
+        if req.side.upper() == "BUY":
+            notional = req.price * req.size_shares
+            bankroll = self.settings.paper_starting_bankroll
+            pos_cap = position_notional_cap(self.settings, bankroll)
+            if notional > pos_cap + 1e-4:
+                return "position_usd_cap"
+            exposure_fn = getattr(broker, "exposure", None)
+            if callable(exposure_fn):
+                exp_cap = total_exposure_cap(self.settings, bankroll)
+                if float(exposure_fn()) + notional > exp_cap + 1e-4:
+                    return "exposure_usd_cap"
         oid = self.repo.insert_order(
             {
                 "client_order_id": cid,
