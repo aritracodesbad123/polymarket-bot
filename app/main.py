@@ -22,7 +22,7 @@ from app.monitoring.telegram import Telegram
 from app.portfolio.portfolio import Portfolio
 from app.research.researcher import EvidencePacket, NullResearchProvider, XAISearchProvider
 from app.risk.manager import RiskManager, exposure_from_positions
-from app.risk.regime import RegimeEngine
+from app.risk.regime import RegimeEngine, new_screening_allowed
 from app.storage.db import Database, DatabaseError
 from app.storage.repositories import Repositories
 from app.strategy.evaluator import Decision, StrategyEvaluator
@@ -201,6 +201,53 @@ class TradingApp:
         st = self.repo.state()
         if st.halted:
             return
+        # Exits stay on this path. Session-budget DIE and the post-fill
+        # screening stop only skip the universe scan and new AI calls below.
+        marks: dict[str, float] = {}
+        await self._review_holdings(marks)
+        unreal = 0.0
+        for p in self.paper._positions.values():
+            if p.shares <= 0:
+                continue
+            mpx = marks.get(p.token_id, p.avg_price)
+            unreal += p.shares * (mpx - p.avg_price)
+        equity = self.paper.equity(marks)
+        regime = self.regime.update(equity=equity, unrealized_pnl=unreal)
+        self.log.info(
+            "REGIME mode=%s reason=%s burn=%.4f screening=%s fills=%s",
+            regime.mode,
+            regime.reason,
+            regime.session_ai_cost_usd,
+            regime.screening_allowed,
+            regime.has_taken_fills,
+        )
+        prev = getattr(self, "_last_regime_mode", None)
+        if prev != regime.mode or getattr(self, "_last_screening", None) != regime.screening_allowed:
+            self.repo.event("REGIME", f"{regime.mode} | {regime.reason}", {
+                "mode": regime.mode,
+                "ai_calls": regime.session_ai_calls,
+                "ai_cost": regime.session_ai_cost_usd,
+                "equity": equity,
+                "screening_allowed": regime.screening_allowed,
+                "has_taken_fills": regime.has_taken_fills,
+            })
+            self._last_regime_mode = regime.mode
+            self._last_screening = regime.screening_allowed
+
+        if new_screening_allowed(regime):
+            await self._screen_new_markets(marks)
+        else:
+            self.cycle_stats["candidates"] = 0
+        self.portfolio.snapshot(marks)
+        eq = self.paper.equity(marks)
+        self.risk.daily_pnl = eq - self.settings.paper_starting_bankroll
+        self.risk.note_equity(eq, self.settings.paper_starting_bankroll)
+        mismatch = await self.paper.reconcile()
+        if mismatch:
+            self.risk.note_recon_mismatch(mismatch)
+
+    async def _screen_new_markets(self, marks: dict[str, float]) -> None:
+        self.cycle_stats["candidates"] = 0
         try:
             scanned = await self.scanner.scan()
             self.risk.note_api_ok()
@@ -234,54 +281,37 @@ class TradingApp:
             if reason is None:
                 candidates.append(m)
         self.cycle_stats["candidates"] = len(candidates)
-        marks: dict[str, float] = {}
-        await self._review_holdings(marks)
-        unreal = 0.0
-        for p in self.paper._positions.values():
-            if p.shares <= 0:
-                continue
-            mpx = marks.get(p.token_id, p.avg_price)
-            unreal += p.shares * (mpx - p.avg_price)
-        equity = self.paper.equity(marks)
-        regime = self.regime.update(equity=equity, unrealized_pnl=unreal)
-        self.log.info("REGIME mode=%s reason=%s burn=%.4f", regime.mode, regime.reason, regime.session_ai_cost_usd)
-        prev = getattr(self, "_last_regime_mode", None)
-        if prev != regime.mode:
-            self.repo.event("REGIME", f"{regime.mode} | {regime.reason}", {
-                "mode": regime.mode,
-                "ai_calls": regime.session_ai_calls,
-                "ai_cost": regime.session_ai_cost_usd,
-                "equity": equity,
-            })
-            self._last_regime_mode = regime.mode
-
         grok_calls = 0
-        max_calls = self.regime.max_ai_calls(regime.mode)
+        max_calls = self.regime.max_ai_calls()
+        if max_calls <= 0:
+            return
         positions = await self.paper.positions()
-        if regime.mode != "DIE" and max_calls > 0:
-            for m in candidates:
-                if grok_calls >= max_calls:
-                    break
-                if self.repo.state().halted:
-                    break
-                used = await self._consider(m, positions, marks)
-                if used:
-                    grok_calls += 1
-                    self.regime.note_ai_call(1)
-                gemini_ready = bool(self.engine and self.engine.gemini)
-                grok_dead = bool(
-                    getattr(self.research, "blocked", False)
-                    or (self.engine and self.engine.grok and self.engine.grok.blocked)
-                )
-                if grok_dead and not gemini_ready:
-                    break
-        self.portfolio.snapshot(marks)
-        eq = self.paper.equity(marks)
-        self.risk.daily_pnl = eq - self.settings.paper_starting_bankroll
-        self.risk.note_equity(eq, self.settings.paper_starting_bankroll)
-        mismatch = await self.paper.reconcile()
-        if mismatch:
-            self.risk.note_recon_mismatch(mismatch)
+        for m in candidates:
+            if grok_calls >= max_calls:
+                break
+            if self.repo.state().halted:
+                break
+            used = await self._consider(m, positions, marks)
+            if used:
+                grok_calls += 1
+                self.regime.note_ai_call(1)
+            last = self.regime.last
+            burn = self.regime.session_ai_cost_usd
+            budget = self.settings.ai_session_budget_usd
+            if (
+                last is not None
+                and not last.has_taken_fills
+                and budget > 0
+                and burn >= budget
+            ):
+                break
+            gemini_ready = bool(self.engine and self.engine.gemini)
+            grok_dead = bool(
+                getattr(self.research, "blocked", False)
+                or (self.engine and self.engine.grok and self.engine.grok.blocked)
+            )
+            if grok_dead and not gemini_ready:
+                break
 
     async def _books(self, m):
         yes_book = await self.data.get_order_book(m.yes_token_id, m.market_id)

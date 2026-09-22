@@ -20,6 +20,7 @@ def test_defaults():
     assert s.live_trading_enabled is False
     assert s.trading_mode == "paper"
     assert s.api_die_cushion_usd == 0.50
+    assert s.ai_session_budget_usd == 10.0
     assert s.estimated_usd_per_ai_call == 0.02
     assert s.kill_floor_pct == 0.20
     assert s.weekly_loss_pct is None

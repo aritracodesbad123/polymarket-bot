@@ -80,7 +80,10 @@ def test_burn_persists_across_restart_and_multiple_calls(tmp_path):
     eng2 = RegimeEngine(s, repo, now=now)
     assert eng2.session_ai_calls == 3
     assert eng2.session_ai_cost_usd == pytest.approx(3 * s.estimated_usd_per_ai_call)
-    assert eng2.update(equity=50.0, unrealized_pnl=0.0).mode == "DIE"
+    # $0.06 is under the session budget. Cushion 0 is not a spend cap.
+    restarted = eng2.update(equity=50.0, unrealized_pnl=0.0)
+    assert restarted.mode == "ATTACK"
+    assert restarted.screening_allowed
     box["t"] = datetime(2026, 9, 23, 0, 5, tzinfo=timezone.utc)
     eng3 = RegimeEngine(s, repo, now=now)
     assert eng3.session_ai_calls == 0
@@ -93,14 +96,20 @@ def test_burn_persists_across_restart_and_multiple_calls(tmp_path):
 def test_same_process_day_rollover_clears_burn(tmp_path):
     _d, repo = db(tmp_path)
     box, now = _clock(datetime(2026, 9, 22, 23, tzinfo=timezone.utc))
-    s = _settings(api_die_cushion_usd=0.0)
+    s = _settings(
+        api_die_cushion_usd=0.0,
+        ai_session_budget_usd=0.02,
+        estimated_usd_per_ai_call=0.02,
+    )
     eng = RegimeEngine(s, repo, now=now)
     eng.note_ai_call(1)
     assert eng.update(equity=50.0, unrealized_pnl=0.0).mode == "DIE"
+    assert eng.last.reason.startswith("ai_session_budget")
     box["t"] = datetime(2026, 9, 23, 0, 1, tzinfo=timezone.utc)
     st = eng.update(equity=50.0, unrealized_pnl=0.0)
     assert eng.session_ai_calls == 0
     assert st.mode == "ATTACK"
+    assert st.screening_allowed
 
 
 def test_zero_burn_then_first_paid_call_persisted(tmp_path):
@@ -111,7 +120,9 @@ def test_zero_burn_then_first_paid_call_persisted(tmp_path):
     eng.note_ai_call(1)
     died = RegimeEngine(s, repo)
     assert died.session_ai_calls == 1
-    assert died.update(equity=50.0, unrealized_pnl=0.0).mode == "DIE"
+    restarted = died.update(equity=50.0, unrealized_pnl=0.0)
+    assert restarted.mode == "ATTACK"
+    assert restarted.screening_allowed
 
 
 def test_burn_read_failure_closed():
@@ -626,6 +637,7 @@ def test_optional_caps_from_env(monkeypatch, tmp_path):
     monkeypatch.setenv("MAX_DAILY_LOSS_USD", "50")
     monkeypatch.setenv("WEEKLY_LOSS_PCT", "0.05")
     monkeypatch.setenv("API_DIE_CUSHION_USD", "0")
+    monkeypatch.setenv("AI_SESSION_BUDGET_USD", "10")
     monkeypatch.setenv("PAPER_STARTING_BANKROLL", "5000")
     s = Settings.from_env(dotenv_path=tmp_path / "none.env")
     assert s.max_position_usd == 25
@@ -633,6 +645,7 @@ def test_optional_caps_from_env(monkeypatch, tmp_path):
     assert s.max_daily_loss_usd == 50
     assert s.weekly_loss_pct == pytest.approx(0.05)
     assert s.api_die_cushion_usd == 0
+    assert s.ai_session_budget_usd == 10.0
     assert s.paper_starting_bankroll == 5000
     assert s.min_edge == 0.05
     assert s.max_spread == 0.06

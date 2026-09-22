@@ -1,8 +1,13 @@
 """ATTACK / DEFEND / DIE — pay for yourself or stop burning capital and API.
 
 Day-scoped AI burn and the weekly equity baseline live in system_state.
-A restart must not zero the cost-versus-return DIE control. If that state
+A restart must not zero the cost-versus-return controls. If that state
 cannot be read or written, the engine fails closed.
+
+Session spend is AI_SESSION_BUDGET_USD, not API_DIE_CUSHION_USD.
+No fills: burn >= budget stops new screening (DIE, no halt).
+Fills or open positions: stop new screening when unrealized PnL < burn.
+Holding review and exits are not part of this gate.
 """
 
 from __future__ import annotations
@@ -35,6 +40,13 @@ class RegimeState:
     session_ai_cost_usd: float
     equity: float
     start_bankroll: float
+    screening_allowed: bool = True
+    has_taken_fills: bool = False
+
+
+def new_screening_allowed(state: RegimeState) -> bool:
+    """New universe scan and AI calls. Holdings are a separate path."""
+    return bool(state.screening_allowed) and state.mode != "DIE"
 
 
 class RegimeEngine:
@@ -195,17 +207,67 @@ class RegimeEngine:
             return None
         return self._week_baseline * (1.0 - float(self.settings.weekly_loss_pct or 0.0))
 
-    def update(self, *, equity: float, unrealized_pnl: float) -> RegimeState:
+    def _resolve_fills(self, has_taken_fills: bool | None) -> bool:
+        if has_taken_fills is not None:
+            return bool(has_taken_fills)
+        if self.repo is None:
+            return False
+        return self.repo.cohort_has_taken_fills()
+
+    def _defend_reason(
+        self, *, equity: float, unrealized_pnl: float, burn: float, start: float
+    ) -> str | None:
+        """Cushion is a DEFEND band. Zero turns the band off; it is not a budget."""
+        cushion = self.settings.api_die_cushion_usd
+        if cushion <= 0:
+            return None
+        profit = max(0.0, equity - start)
+        cushion_line = profit + cushion
+        if equity < start - cushion:
+            return f"equity_below_start {equity:.2f}<{start:.2f}"
+        if unrealized_pnl < -cushion:
+            return f"unrealized {unrealized_pnl:.4f}"
+        if burn >= cushion_line * 0.5 and cushion_line > 0:
+            return f"burn_half_cushion {burn:.4f}"
+        return None
+
+    def _spend_stop(
+        self, *, burn: float, unrealized_pnl: float, has_fills: bool
+    ) -> tuple[str, str] | None:
+        """Screening stop from session AI spend.
+
+        No fills: hard budget, reported as DIE. Does not halt the bot.
+        Fills exist: stop screening when unrealized PnL is under the burn.
+        Zero burn never stops screening (startup and UTC-day rollover).
+        """
+        if burn <= 0:
+            return None
+        if not has_fills:
+            budget = self.settings.ai_session_budget_usd
+            if budget > 0 and burn >= budget:
+                return ("DIE", f"ai_session_budget {burn:.4f}>={budget:.4f}")
+            return None
+        if unrealized_pnl < burn:
+            return (
+                "SCREEN",
+                f"screening_stop unrealized {unrealized_pnl:.4f}<burn {burn:.4f}",
+            )
+        return None
+
+    def update(
+        self,
+        *,
+        equity: float,
+        unrealized_pnl: float,
+        has_taken_fills: bool | None = None,
+    ) -> RegimeState:
         self._roll_day()
         self._roll_week(equity)
         s = self.settings
         start = s.paper_starting_bankroll
         burn = self.session_ai_cost_usd
         kill_floor = start * (1.0 - s.kill_floor_pct)
-        profit = max(0.0, equity - start)
-        # Cushion stays configurable. Zero cushion is `burn >= profit`, but a
-        # zero burn must not DIE when profit is also zero.
-        die_burn_line = profit + s.api_die_cushion_usd
+        has_fills = self._resolve_fills(has_taken_fills)
 
         weekly_floor = self._weekly_floor()
         weekly_breach = weekly_floor is not None and equity <= weekly_floor
@@ -215,8 +277,22 @@ class RegimeEngine:
                 f"baseline={self._week_baseline:.2f}"
             )
 
-        def finish(mode: str, reason: str) -> RegimeState:
-            st = RegimeState(mode, reason, self.session_ai_calls, burn, equity, start)
+        def finish(
+            mode: str,
+            reason: str,
+            *,
+            screening_allowed: bool,
+        ) -> RegimeState:
+            st = RegimeState(
+                mode,
+                reason,
+                self.session_ai_calls,
+                burn,
+                equity,
+                start,
+                screening_allowed=screening_allowed,
+                has_taken_fills=has_fills,
+            )
             self.last = st
             return st
 
@@ -224,41 +300,44 @@ class RegimeEngine:
             return finish(
                 "DIE",
                 f"weekly_equity_stop equity={equity:.2f}<={weekly_floor:.2f}",
+                screening_allowed=False,
             )
 
         if not s.regime_enabled:
-            return finish("ATTACK", "regime_disabled")
+            return finish("ATTACK", "regime_disabled", screening_allowed=True)
 
         if equity <= kill_floor:
             return finish(
                 "DIE",
                 f"kill_floor equity={equity:.2f}<={kill_floor:.2f}",
+                screening_allowed=False,
             )
         if weekly_breach:
             return finish(
                 "DIE",
                 f"weekly_equity_stop equity={equity:.2f}<={weekly_floor:.2f} "
                 f"baseline={self._week_baseline:.2f}",
-            )
-        if burn > 0 and burn >= die_burn_line:
-            return finish(
-                "DIE",
-                f"api_burn {burn:.4f}>={die_burn_line:.4f}",
+                screening_allowed=False,
             )
 
-        defend = False
-        reason = "healthy"
-        if equity < start - s.api_die_cushion_usd:
-            defend = True
-            reason = f"equity_below_start {equity:.2f}<{start:.2f}"
-        elif unrealized_pnl < -s.api_die_cushion_usd:
-            defend = True
-            reason = f"unrealized {unrealized_pnl:.4f}"
-        elif burn >= die_burn_line * 0.5 and die_burn_line > 0:
-            defend = True
-            reason = f"burn_half_cushion {burn:.4f}"
+        spend = self._spend_stop(
+            burn=burn, unrealized_pnl=unrealized_pnl, has_fills=has_fills
+        )
+        defend_reason = self._defend_reason(
+            equity=equity, unrealized_pnl=unrealized_pnl, burn=burn, start=start
+        )
+        if spend is not None and spend[0] == "DIE":
+            return finish("DIE", spend[1], screening_allowed=False)
+        if spend is not None:
+            mode = "DEFEND" if defend_reason else "ATTACK"
+            reason = spend[1] if not defend_reason else f"{spend[1]}; {defend_reason}"
+            return finish(mode, reason, screening_allowed=False)
 
-        return finish("DEFEND" if defend else "ATTACK", reason)
+        return finish(
+            "DEFEND" if defend_reason else "ATTACK",
+            defend_reason or "healthy",
+            screening_allowed=True,
+        )
 
     def evaluate_kwargs(self, mode: str | None = None) -> dict:
         m = mode or (self.last.mode if self.last else "ATTACK")
@@ -273,6 +352,8 @@ class RegimeEngine:
     def max_ai_calls(self, mode: str | None = None) -> int:
         m = mode or (self.last.mode if self.last else "ATTACK")
         if m == "DIE":
+            return 0
+        if self.last is not None and not self.last.screening_allowed:
             return 0
         if m == "DEFEND":
             return min(self.settings.max_grok_calls_per_cycle, self.settings.defend_max_grok_calls)
