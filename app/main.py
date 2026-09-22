@@ -10,6 +10,12 @@ from app.ai.prompt_manager import PromptManager
 from app.ai.grok_client import GrokClient
 from app.ai.gemini_client import GeminiClient
 from app.ai.credits import CreditHardFail
+from app.ai.microstructure import (
+    MICRO_MIN_CONFIDENCE,
+    MICRO_PROVIDER,
+    MicrostructureEstimator,
+    MicrostructureResult,
+)
 from app.broker.live import LiveBroker
 from app.broker.paper import PaperBroker
 from app.config import Settings
@@ -28,7 +34,7 @@ from app.monitoring.telegram import Telegram
 from app.portfolio.portfolio import Portfolio
 from app.research.researcher import EvidencePacket, NullResearchProvider, XAISearchProvider
 from app.risk.manager import RiskManager, exposure_from_positions
-from app.risk.regime import RegimeEngine, new_screening_allowed
+from app.risk.regime import RegimeEngine, RegimeState, ai_spend_blocked_screening, new_screening_allowed
 from app.storage.db import Database, DatabaseError
 from app.storage.repositories import Repositories
 from app.strategy.evaluator import Decision, StrategyEvaluator
@@ -149,6 +155,15 @@ class TradingApp:
         self.risk = RiskManager(settings, self.repo)
         self.regime = RegimeEngine(settings, self.repo)
         self.strategy = StrategyEvaluator(settings)
+        self.micro = MicrostructureEstimator(
+            min_edge=settings.min_edge,
+            max_spread=settings.max_spread,
+            min_confidence=max(settings.min_confidence_score, MICRO_MIN_CONFIDENCE),
+            min_liquidity=settings.min_liquidity,
+        )
+        # Test switch. Production uses ESTIMATOR=microstructure, which turns
+        # the book estimator on only after the AI budget stops screening.
+        self.force_microstructure = False
         self.telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
         self.stop = False
         self.cycle_stats = {
@@ -208,7 +223,8 @@ class TradingApp:
         if st.halted:
             return
         # Exits stay on this path. Session-budget DIE and the post-fill
-        # screening stop only skip the universe scan and new AI calls below.
+        # screening stop skip new AI calls. ESTIMATOR=microstructure keeps
+        # the scan on that path and prices the book instead of calling an LLM.
         marks: dict[str, float] = {}
         await self._review_holdings(marks)
         unreal = 0.0
@@ -240,7 +256,14 @@ class TradingApp:
             self._last_regime_mode = regime.mode
             self._last_screening = regime.screening_allowed
 
-        if new_screening_allowed(regime):
+        micro = self._microstructure_active(regime)
+        if new_screening_allowed(regime) or micro:
+            if micro and not new_screening_allowed(regime):
+                self.log.info(
+                    "SCREEN provider=%s reason=%s",
+                    MICRO_PROVIDER,
+                    regime.reason,
+                )
             await self._screen_new_markets(marks)
         else:
             self.cycle_stats["candidates"] = 0
@@ -287,8 +310,15 @@ class TradingApp:
             if reason is None:
                 candidates.append(m)
         self.cycle_stats["candidates"] = len(candidates)
+        micro = self._microstructure_active()
         grok_calls = 0
-        max_calls = self.regime.max_ai_calls()
+        # Micro quotes are free. Keep the per-cycle candidate cap, but do not
+        # touch the AI burn counter and do not stop because that burn is full.
+        max_calls = (
+            self.settings.max_grok_calls_per_cycle
+            if micro
+            else self.regime.max_ai_calls()
+        )
         if max_calls <= 0:
             return
         positions = await self.paper.positions()
@@ -300,7 +330,10 @@ class TradingApp:
             used = await self._consider(m, positions, marks)
             if used:
                 grok_calls += 1
-                self.regime.note_ai_call(1)
+                if not micro:
+                    self.regime.note_ai_call(1)
+            if micro:
+                continue
             last = self.regime.last
             burn = self.regime.session_ai_cost_usd
             budget = self.settings.ai_session_budget_usd
@@ -341,7 +374,51 @@ class TradingApp:
             return True
         return bool(self.engine and self.engine.provider == "gemini")
 
+    def _log_micro(self, market, result: MicrostructureResult) -> None:
+        fair = result.fair
+        conf = result.confidence_score
+        self.log.info(
+            "ESTIMATE provider=%s market=%s fair=%s conf=%s buy_edge=%s sell_edge=%s reject=%s",
+            MICRO_PROVIDER,
+            market.market_id,
+            f"{fair:.4f}" if fair is not None else "none",
+            f"{conf:.3f}" if conf is not None else "none",
+            f"{result.buy_yes_edge:.4f}" if result.buy_yes_edge is not None else "none",
+            f"{result.sell_no_edge:.4f}" if result.sell_no_edge is not None else "none",
+            result.reject_reason or "",
+        )
+        self.repo.event(
+            "AI_ESTIMATE",
+            f"provider={MICRO_PROVIDER}",
+            {"provider": MICRO_PROVIDER, "market_id": market.market_id, **result.as_fields()},
+        )
+
+    def enable_microstructure(self) -> None:
+        """Force the book estimator on (tests).
+
+        Production leaves this off. ``ESTIMATOR=microstructure`` turns the
+        estimator on by itself once the AI session budget stops screening.
+        """
+        self.force_microstructure = True
+
+    def _microstructure_active(self, regime: RegimeState | None = None) -> bool:
+        """Price the book instead of calling an LLM. Does not loosen stops."""
+        if self.force_microstructure:
+            return True
+        name = (self.settings.estimator or "").strip().lower()
+        if name != "microstructure":
+            return False
+        st = self.regime.last if regime is None else regime
+        if st is None:
+            return False
+        return ai_spend_blocked_screening(st)
+
+    def _micro_confidence_floor(self) -> float:
+        return max(self.settings.min_confidence_score, MICRO_MIN_CONFIDENCE)
+
     def _provider_tag(self) -> str:
+        if self._microstructure_active():
+            return MICRO_PROVIDER
         if not self.engine:
             return "none"
         prov = self.engine.provider or "none"
@@ -360,6 +437,24 @@ class TradingApp:
         }
 
     def _strategy_kwargs(self) -> dict:
+        # Book path keeps Kelly / edge floors from settings (and DEFEND, if
+        # that band is on). It does not apply the Gemini survival tighten.
+        if self._microstructure_active():
+            kw: dict = {
+                "min_confidence_score": self._micro_confidence_floor(),
+            }
+            rk = self.regime.evaluate_kwargs()
+            if not rk:
+                return kw
+            s = self.settings
+            if "min_edge" in rk:
+                kw["min_edge"] = max(kw.get("min_edge", s.min_edge), rk["min_edge"])
+            if "kelly_multiplier" in rk:
+                kw["kelly_multiplier"] = min(
+                    kw.get("kelly_multiplier", s.kelly_multiplier),
+                    rk["kelly_multiplier"],
+                )
+            return kw
         kw = dict(self._gemini_strategy_kwargs())
         rk = self.regime.evaluate_kwargs()
         if not rk:
@@ -552,37 +647,65 @@ class TradingApp:
             market_price=yes_book.best_ask,
             implied_probability=yes_book.midpoint,
         )
-        if not self._skip_xai_search():
-            try:
-                packet = await self.research.gather(packet)
-            except CreditHardFail as exc:
-                self.repo.event("GROK_ERROR", f"research:{exc}")
-                if self.engine and self.engine.grok:
-                    self.engine.grok.blocked = True
-            except Exception as exc:
-                self.repo.event("GROK_ERROR", f"research:{exc}")
-                self._reject(m, "research_failed")
+        micro_result: MicrostructureResult | None = None
+        if self._microstructure_active():
+            # Book mispricing only. Do not search and do not call the LLM.
+            packet.base_rate_note = "microstructure book fair value; not an event forecast"
+            kw = self._strategy_kwargs()
+            micro_result = self.micro.estimate(
+                yes_book,
+                market_id=m.market_id,
+                category=m.category or "other",
+                min_edge=kw.get("min_edge", self.settings.min_edge),
+                min_confidence=self._micro_confidence_floor(),
+            )
+            self._log_micro(m, micro_result)
+            if micro_result.reject_reason or micro_result.estimate is None:
+                self._reject(
+                    m,
+                    micro_result.reject_reason or "micro_reject",
+                    extra=micro_result.as_fields(),
+                )
+                return False
+            est = micro_result.estimate
+        else:
+            if not self._skip_xai_search():
+                try:
+                    packet = await self.research.gather(packet)
+                except CreditHardFail as exc:
+                    self.repo.event("GROK_ERROR", f"research:{exc}")
+                    if self.engine and self.engine.grok:
+                        self.engine.grok.blocked = True
+                except Exception as exc:
+                    self.repo.event("GROK_ERROR", f"research:{exc}")
+                    self._reject(m, "research_failed")
+                    return True
+            evid_id = self.repo.insert_evidence(
+                m.market_id, packet.model_dump(mode="json")
+            )
+            if self.engine is None:
+                self._reject(m, "no_xai_key")
                 return True
-        evid_id = self.repo.insert_evidence(m.market_id, packet.model_dump(mode="json"))
-        if self.engine is None:
-            self._reject(m, "no_xai_key")
-            return True
-        try:
-            est = await self.engine.estimate(packet)
-        except InvalidEstimate as exc:
-            self.repo.event("GROK_ERROR", exc.reason)
-            # Soft Gemini rejects (cooldown / cascade parse-miss) must not inflate
-            # repeated_ai_errors — same class of bug as counting spread as stale.
-            if not _soft_ai_reject(exc.reason):
-                self.cycle_stats["ai_errors"] += 1
-                self.risk.note_ai_error(self.cycle_stats["ai_errors"])
-            self._reject(m, exc.reason)
-            return True
-        # Successful estimate clears hard AI-error streak.
-        self.cycle_stats["ai_errors"] = 0
-        if self._pending_ai_provider_notice:
-            await self.notify(self._pending_ai_provider_notice)
-            self._pending_ai_provider_notice = None
+            try:
+                est = await self.engine.estimate(packet)
+            except InvalidEstimate as exc:
+                self.repo.event("GROK_ERROR", exc.reason)
+                # Soft Gemini rejects (cooldown / cascade parse-miss) must not inflate
+                # repeated_ai_errors — same class of bug as counting spread as stale.
+                if not _soft_ai_reject(exc.reason):
+                    self.cycle_stats["ai_errors"] += 1
+                    self.risk.note_ai_error(self.cycle_stats["ai_errors"])
+                self._reject(m, exc.reason)
+                return True
+            # Successful LLM estimate clears the hard AI-error streak.
+            self.cycle_stats["ai_errors"] = 0
+            if self._pending_ai_provider_notice:
+                await self.notify(self._pending_ai_provider_notice)
+                self._pending_ai_provider_notice = None
+        if micro_result is not None:
+            evid_id = self.repo.insert_evidence(
+                m.market_id, packet.model_dump(mode="json")
+            )
         pred_id = self.repo.insert_prediction(
             {
                 "market_id": m.market_id,
@@ -652,6 +775,16 @@ class TradingApp:
             ident = self._market_identity(m)
             gates_out = decision.gates_dict()
             gates_out["ai_provider"] = {"passed": True, "detail": self._provider_tag()}
+            if micro_result is not None:
+                gates_out["microstructure"] = {
+                    "passed": bool(
+                        micro_result.estimate
+                        and not micro_result.estimate.should_abstain
+                        and micro_result.side
+                    ),
+                    "detail": f"provider={MICRO_PROVIDER}",
+                    **micro_result.as_fields(),
+                }
             gates_out["market"] = {"passed": True, "detail": f"{ident['instrument']} | {ident['question'][:80]}", **ident}
             did = self.repo.insert_decision(
                 {

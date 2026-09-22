@@ -49,6 +49,21 @@ def new_screening_allowed(state: RegimeState) -> bool:
     return bool(state.screening_allowed) and state.mode != "DIE"
 
 
+def ai_spend_blocked_screening(state: RegimeState) -> bool:
+    """True when session AI spend stopped new screening.
+
+    Covers the no-fill DIE (``ai_session_budget``) and the post-fill
+    ``screening_stop``. Kill floor and the weekly equity stop stay blocked
+    even if a non-LLM estimator is armed.
+    """
+    if state.screening_allowed and state.mode != "DIE":
+        return False
+    reason = state.reason or ""
+    if reason.startswith("kill_floor") or reason.startswith("weekly_equity_stop"):
+        return False
+    return reason.startswith("ai_session_budget") or reason.startswith("screening_stop")
+
+
 class RegimeEngine:
     """Day-scoped AI burn and weekly equity stop.
 
