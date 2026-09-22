@@ -97,6 +97,8 @@ async def cmd_open_marks(app: TradingApp) -> int:
         token_id = r["token_id"]
         market_id = r["market_id"]
         shares = float(r["shares"])
+        if shares <= 1e-12:
+            continue
         entry = float(r["avg_price"])
         mid = bid = ask = None
         try:
@@ -144,6 +146,8 @@ async def cmd_open_marks(app: TradingApp) -> int:
 
 def cmd_positions(app: TradingApp) -> int:
     for p in app.paper._positions.values():
+        if p.shares <= 1e-12:
+            continue
         print(f"{p.token_id[:16]} shares={p.shares:.4f} avg={p.avg_price:.4f} {p.market_id}")
     return 0
 

@@ -33,6 +33,10 @@ class Resting:
     status: OrderStatus = OrderStatus.OPEN
 
 
+# Long inventory at or under this size is flat: drop it, do not mark it.
+FLAT_SHARES = 1e-12
+
+
 class PaperBroker:
     name = "paper"
 
@@ -54,6 +58,8 @@ class PaperBroker:
         marks = marks or {}
         inv = 0.0
         for p in self._positions.values():
+            if p.shares <= FLAT_SHARES:
+                continue
             px = marks.get(p.token_id, p.avg_price)
             inv += p.shares * px
         return self.cash + self.reserved + inv
@@ -62,6 +68,8 @@ class PaperBroker:
         marks = marks or {}
         tot = 0.0
         for p in self._positions.values():
+            if p.shares <= FLAT_SHARES:
+                continue
             px = marks.get(p.token_id, p.avg_price)
             tot += p.shares * px
         return tot + self.reserved
@@ -195,7 +203,7 @@ class PaperBroker:
         self, req: OrderRequest, book: OrderBook, decision: Decision
     ) -> OrderRecord:
         pos = self._positions.get(req.token_id)
-        if pos is None or pos.shares <= 1e-12:
+        if pos is None or pos.shares <= FLAT_SHARES:
             rec = OrderRecord(
                 client_order_id=req.client_order_id,
                 status=OrderStatus.REJECTED,
@@ -221,7 +229,7 @@ class PaperBroker:
         self.realized_pnl += pnl
         pos.realized_pnl += pnl
         pos.shares -= filled
-        if pos.shares <= 1e-12:
+        if pos.shares <= FLAT_SHARES:
             del self._positions[req.token_id]
         rec = OrderRecord(
             client_order_id=req.client_order_id,
@@ -327,7 +335,7 @@ class PaperBroker:
                 "realized_pnl": p.realized_pnl,
             }
             for p in self._positions.values()
-            if p.shares > 0
+            if p.shares > FLAT_SHARES
         ]
 
     async def balances(self) -> dict:
