@@ -64,13 +64,13 @@ Two equity stops, both on a $5,000 start:
 | Catastrophic kill floor | `KILL_FLOOR_PCT=0.10` | equity <= **$4,500** (10% of starting bankroll). Regime DIE `kill_floor`. |
 | Weekly stop | `WEEKLY_LOSS_PCT=0.05` | equity <= **$4,750** when the week baseline is $5,000 (5% of that baseline). Regime DIE `weekly_equity_stop` and HALTED. |
 | No-fill AI budget | `AI_SESSION_BUDGET_USD=10` | UTC-day AI burn >= **$10** and the cohort has no fills and no open position. Regime DIE `ai_session_budget`. Does **not** HALT. |
-| Post-fill screening stop | (same burn counter) | Any fill or open position exists, burn > 0, and unrealized PnL < that burn. Screening stops. Mode stays ATTACK/DEFEND. Does **not** HALT or DIE. |
+| Post-fill screening stop | (same burn counter) | Any fill or open position exists, burn > 0, and (legacy) unrealized PnL < burn — or with `ESTIMATOR_AUTO_SWITCH`, daily realized ≤ burn or burn ≥ budget. Screening stops for LLM; `ESTIMATOR=microstructure` keeps the book path. Mode stays ATTACK/DEFEND. Does **not** HALT or DIE. |
 
 The kill floor is measured against starting bankroll. The weekly stop is measured against the persisted week-start baseline. The daily loss rule is separate again: percentage `MAX_DAILY_LOSS_PCT` plus absolute `MAX_DAILY_LOSS_USD=50`, stricter one wins.
 
 Session AI burn is the persisted UTC-day call count times `ESTIMATED_USD_PER_AI_CALL`. It survives restart and resets on the next UTC day. Zero burn does not DIE and does not stop screening, including at startup and after that rollover.
 
-`AI_SESSION_BUDGET_USD` is the hard cap for the pre-fill path only. Once `fills` has a row, or `positions` has shares > 0, that cap is not the screening rule: new screening stops only while unrealized PnL is strictly under the session burn. Unrealized PnL at or above the burn keeps screening, even if burn is past $10. Holding review and exits keep running in every non-HALTED cycle, including after `ai_session_budget` DIE and after the post-fill screening stop. A Gamma scan error does not skip that review.
+`AI_SESSION_BUDGET_USD` is the hard cap for the pre-fill path only. Once `fills` has a row, or `positions` has shares > 0, that cap is not the no-fill DIE rule. Legacy (`ESTIMATOR_AUTO_SWITCH=0`): new LLM screening stops only while unrealized PnL is strictly under the session burn; unrealized at or above the burn keeps LLM screening even if burn is past $10. With auto-switch ON (default when `ESTIMATOR=microstructure`): use daily realized PnL vs burn, and burn ≥ budget always forces micro (no LLM past $10). Holding review and exits keep running in every non-HALTED cycle, including after `ai_session_budget` DIE and after the post-fill screening stop. A Gamma scan error does not skip that review.
 
 `API_DIE_CUSHION_USD` is only the DEFEND band (equity below start by the cushion, unrealized worse than minus the cushion, or burn past half of profit+cushion). It is not the spend budget. Do not set it to `10` to buy hunt time. `0` turns the DEFEND band off so a flat or slightly red book stays ATTACK until the session budget, the post-fill rule, the kill floor, or the weekly stop. `<=0` on `AI_SESSION_BUDGET_USD` disables the hard no-fill cap; the cohort value is `10`.
 
@@ -80,8 +80,19 @@ Before research or `engine.estimate`, the fresh book mid must lie in `[MIN_TRADE
 
 `ESTIMATOR=microstructure` keeps that scan running after the no-fill budget DIE or the post-fill screening stop, and prices the book instead of calling a model. Unset (or any other value) keeps the burn-stop. Kill floor and the weekly equity stop stay dark. Survival gates are not loosened: `MIN_EDGE`, `MAX_SPREAD`, the mid band, Kelly `0.25`, and the USD caps stay as they are.
 
+With `ESTIMATOR=microstructure`, `ESTIMATOR_AUTO_SWITCH` defaults **ON**. After fills, new screening flips on **daily realized PnL** (after fees) vs session AI burn:
+
+| Condition | New screening provider |
+|---|---|
+| realized > burn **and** burn < `AI_SESSION_BUDGET_USD` | LLM (grok/gemini) |
+| realized < burn **or** burn ≥ budget **or** realized unknown / equal | `micro` |
+| no fills yet | LLM until no-fill budget DIE, then `micro` (no LLM flip-back while burn ≥ $10) |
+
+Open tickets still exit/hold on either path. Only new estimates switch. Transitions log `ESTIMATOR_SWITCH from=… to=llm|micro provider=… reason=pnl_gt_burn|realized_lt_burn|burn_exhausted|ai_session_budget|…` and a matching `system_events` row. Set `ESTIMATOR_AUTO_SWITCH=0` for the older micro-after-stop behavior (unrealized post-fill rule, no realized flip-back).
+
 ```bash
 ESTIMATOR=microstructure
+ESTIMATOR_AUTO_SWITCH=1
 MICRO_LAMBDA=0.08
 MICRO_MIN_ABS_I=0.40
 MICRO_COIN_FLIP_MIN=0.45

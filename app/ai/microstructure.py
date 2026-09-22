@@ -1,7 +1,11 @@
 """Rule-based book estimator. It does not forecast the event.
 
-Used only when ``ESTIMATOR=microstructure`` and the AI session budget has
-stopped new screening (or when a test forces it on). No LLM call.
+Used when ``ESTIMATOR=microstructure`` and the AI session budget has stopped
+new LLM screening (or when a test forces it on). With
+``ESTIMATOR_AUTO_SWITCH`` (default ON), the loop can flip back to an LLM when
+daily realized PnL covers burn and burn is under the session budget, then
+return here when realized slips under burn or burn hits the budget. No LLM
+call on this path.
 
 Phase 1 fair value (replaces the Phase 0 half-spread cap):
 

@@ -112,6 +112,10 @@ class Settings(BaseModel):
     # ``microstructure`` arms the non-LLM book estimator after the session
     # budget stops screening. Unset (or any other value) keeps the burn-stop.
     estimator: str | None = None
+    # When ESTIMATOR=microstructure: flip LLM↔micro on realized PnL vs burn.
+    # Default ON. Set ESTIMATOR_AUTO_SWITCH=0 for micro-after-stop only (no
+    # realized flip-back). Ignored unless estimator is microstructure.
+    estimator_auto_switch: bool = True
     # Phase 1 book fair: clip(mid + λ × imbalance, 0.01, 0.99). Not a Survival gate.
     micro_lambda: float = 0.08
     # Reject microstructure quotes with a weaker absolute imbalance.
@@ -212,6 +216,7 @@ class Settings(BaseModel):
             estimated_usd_per_ai_call=_f("ESTIMATED_USD_PER_AI_CALL", 0.02),
             ai_session_budget_usd=_f("AI_SESSION_BUDGET_USD", 10.0),
             estimator=_s("ESTIMATOR", "").lower() or None,
+            estimator_auto_switch=_b("ESTIMATOR_AUTO_SWITCH", True),
             micro_lambda=_f("MICRO_LAMBDA", 0.08),
             micro_min_abs_imbalance=_f("MICRO_MIN_ABS_I", 0.40),
             micro_coin_flip_min=_f("MICRO_COIN_FLIP_MIN", 0.45),
