@@ -49,11 +49,11 @@ MODE: HALTED
 ========================================
 """.strip()
 
-# Temporary Gemini tighten (verdict: +1–2¢). Kept light so paper can clear edge while Grok is down.
-GEMINI_EDGE_TIGHTEN = 0.01
+# Survival lock while on Gemini (Max/John): +2¢ edge, half Kelly, higher conf, fee-aware floor.
+GEMINI_EDGE_TIGHTEN = 0.02
 GEMINI_KELLY_MULTIPLIER = 0.125
-GEMINI_MIN_CONFIDENCE = 0.40
-GEMINI_MIN_EXEC_EDGE = 0.01
+GEMINI_MIN_CONFIDENCE = 0.50
+GEMINI_MIN_EXEC_EDGE = 0.02
 
 
 
@@ -139,6 +139,7 @@ class TradingApp:
         self.live = LiveBroker(settings, self.repo)
         self.executor = Executor(settings, self.repo, self.paper, self.live, self.data)
         self.portfolio = Portfolio(self.paper, self.repo)
+        self.portfolio.hydrate_paper(settings.paper_starting_bankroll)
         self.risk = RiskManager(settings, self.repo)
         self.regime = RegimeEngine(settings)
         self.strategy = StrategyEvaluator(settings)
@@ -377,6 +378,15 @@ class TradingApp:
             if book.best_bid is None or book.bid_depth_usd() <= 0:
                 continue
             limit = float(book.best_bid)
+            exit_key = idempotency_key(
+                pos.market_id,
+                pos.token_id,
+                "SELL",
+                self.settings.strategy_version,
+                kind="exit",
+            )
+            if self.repo.get_decision_by_idempotency(exit_key) or self.repo.get_order_by_idempotency(exit_key):
+                continue
             decision = Decision(
                 approved=True,
                 reject_reason=None,
@@ -407,13 +417,7 @@ class TradingApp:
                     "size_shares": decision.size_shares,
                     "strategy_version": self.settings.strategy_version,
                     "prompt_version": self.settings.prompt_version,
-                    "idempotency_key": idempotency_key(
-                        pos.market_id,
-                        pos.token_id,
-                        "SELL",
-                        self.settings.strategy_version,
-                        kind="exit",
-                    ),
+                    "idempotency_key": exit_key,
                 }
             )
             before_pnl = self.paper.realized_pnl
