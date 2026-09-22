@@ -54,6 +54,8 @@ python -m app.cli run
 | Vertex / Gemini vars | Fallback cascade when xAI is hard-failed (see `docs/MODEL_FALLBACK_STACK.md`) |
 | `UNIVERSE_TAG` / `UNIVERSE_TAGS` | e.g. `crypto` or `crypto,forex` |
 | `MIN_TRADEABLE_MID` / `MAX_TRADEABLE_MID` | Skip the AI estimate when the book mid is outside this band. Defaults `0.10` / `0.90`; edges are tradeable. Reject reason `mid_outside_band`. |
+| `ESTIMATOR` | `microstructure` keeps screening with a book estimator after the AI budget stops. Unset keeps the burn-stop. |
+| `MICRO_LAMBDA` / `MICRO_MIN_ABS_I` | Phase 1 fair shift λ times imbalance (default `0.04`) and minimum absolute imbalance (default `0.40`). |
 | `TRADING_MODE` | `paper` (default) or `live` (still needs full unlock AND-gate) |
 | `LIVE_TRADING_ENABLED` | Must be `true` **and** activation phrase logged to unlock live |
 | `POLYMARKET_PRIVATE_KEY` / wallet | Required only for live |
