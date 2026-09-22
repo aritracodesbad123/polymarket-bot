@@ -1409,7 +1409,7 @@ function render(d){
     <div class="card"><h2>AI budget</h2><div class="big ${(d.ai_budget?.regime_mode==='ATTACK')?'ok':(d.ai_budget?.regime_mode==='DEFEND'?'warn':'bad')}">${esc(d.ai_budget?.regime_mode||'—')} · $${Number(d.ai_budget?.estimated_burn_usd||0).toFixed(2)} / $${Number(d.ai_budget?.session_budget_usd||10).toFixed(0)}</div>
       <div class="meta">est. · ${d.ai_budget?.ai_calls||0} calls · left $${Number(d.ai_budget?.budget_remaining_usd||0).toFixed(2)} · ${esc(d.ai_budget?.regime_reason||'')}</div>
       <div class="meta">as of ${fmtTs(d.ai_budget?.as_of||d.ts)}</div></div>
-    <div class="card"><h2>Trades + PnL</h2><div class="big">${d.trades??d.executed_trades?.length??0} trades</div>
+    <div class="card"><h2>Trades + PnL</h2><div class="big">${(d.trades!=null?d.trades:(d.executed_trades||[]).length)} trades</div>
       <div class="meta">open ${d.open_trades??0} · closed ${d.closed_trades??0} · notional $${Number(d.open_notional).toFixed(2)} · approved 2h ${d.approved_2h}</div>
       <div class="meta">as of ${asOf(d)}</div></div>
     <div class="card"><h2>Paper lock</h2><div class="big">${fmtDur(d.paper_lock_remaining_s)}</div>
@@ -1426,7 +1426,7 @@ function render(d){
         <div><strong>${f.estimates_ok||0}</strong><span>est OK</span></div>
         <div><strong>${f.edge_pass||0}</strong><span>edge pass</span></div>
         <div><strong>${f.size_pass||0}</strong><span>size pass</span></div>
-        <div><strong>${d.trades??f.fills||0}</strong><span>trades</span></div>
+        <div><strong>${(d.trades!=null?d.trades:(f.fills||0))}</strong><span>trades</span></div>
       </div>
       <div class="meta" style="margin-top:8px">avg fee-edge rejects ${d.avg_fee_edge_rejects??'—'} · approvals ${d.avg_fee_edge_approvals??'—'}</div>
     </div>
