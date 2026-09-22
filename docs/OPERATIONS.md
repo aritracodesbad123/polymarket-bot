@@ -76,6 +76,8 @@ Session AI burn is the persisted UTC-day call count times `ESTIMATED_USD_PER_AI_
 
 Leave `ESTIMATED_USD_PER_AI_CALL`, `MIN_EDGE`, and `MAX_SPREAD` at their current values. The code default for `KILL_FLOOR_PCT` remains 0.20; this cohort overrides it to 0.10. The code default for `AI_SESSION_BUDGET_USD` is 10. Gemini Survival lock is unchanged (+2¢ edge, confidence 0.50, extreme 2–98% band, quarter Kelly).
 
+Before research or `engine.estimate`, the fresh book mid must lie in `[MIN_TRADEABLE_MID, MAX_TRADEABLE_MID]`. Unset env uses **0.10** and **0.90**. The edges are tradeable (`0.10` and `0.90` still get an estimate). A mid outside that band is rejected as `mid_outside_band` on the decision and on `system_events` (`TRADE_REJECTED`). That path does not call the model and does not increment the session AI burn. It does not change `AI_SESSION_BUDGET_USD`, the DIE/screening rules, the Gemini Survival lock, the kill floor, the weekly stop, or the absolute caps.
+
 Week boundary is Monday 00:00 UTC. The baseline is the equity at the first cycle of that week and is stored in `system_state`. It resets only on that boundary or via `python -m app.cli reset-week-baseline` (does not clear HALTED). `resume-paper` does not move it.
 
 AI burn is the persisted UTC-day call count times `ESTIMATED_USD_PER_AI_CALL` (not a new rate). Daily realized loss is the persisted UTC-day sum. Both fail closed if they cannot be read or written. Absolute USD caps are optional; when unset, only percentage caps apply. When set, the effective cap is the stricter of the two.

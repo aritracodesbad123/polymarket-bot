@@ -23,10 +23,32 @@ def test_defaults():
     assert s.ai_session_budget_usd == 10.0
     assert s.estimated_usd_per_ai_call == 0.02
     assert s.kill_floor_pct == 0.20
+    assert s.min_tradeable_mid == 0.10
+    assert s.max_tradeable_mid == 0.90
     assert s.weekly_loss_pct is None
     assert s.max_position_usd is None
     assert s.max_total_exposure_usd is None
     assert s.max_daily_loss_usd is None
+
+
+def test_tradeable_mid_from_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("MIN_TRADEABLE_MID", raising=False)
+    monkeypatch.delenv("MAX_TRADEABLE_MID", raising=False)
+    s = Settings.from_env(dotenv_path=tmp_path / "none.env")
+    assert s.min_tradeable_mid == 0.10
+    assert s.max_tradeable_mid == 0.90
+
+    monkeypatch.setenv("MIN_TRADEABLE_MID", "")
+    monkeypatch.setenv("MAX_TRADEABLE_MID", "")
+    blank = Settings.from_env(dotenv_path=tmp_path / "none.env")
+    assert blank.min_tradeable_mid == 0.10
+    assert blank.max_tradeable_mid == 0.90
+
+    monkeypatch.setenv("MIN_TRADEABLE_MID", "0.15")
+    monkeypatch.setenv("MAX_TRADEABLE_MID", "0.85")
+    overridden = Settings.from_env(dotenv_path=tmp_path / "none.env")
+    assert overridden.min_tradeable_mid == 0.15
+    assert overridden.max_tradeable_mid == 0.85
 
 
 def test_gemini_key_stripped(monkeypatch, tmp_path):
