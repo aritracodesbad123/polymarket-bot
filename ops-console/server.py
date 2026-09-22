@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+from contextlib import contextmanager
 import subprocess
 import threading
 import time
@@ -23,14 +24,18 @@ from fastapi.responses import HTMLResponse, JSONResponse
 HOME = Path.home()
 # ops-console/ lives inside the bot repo
 BOT_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BOT_DIR / "polygrok.db"
+DB_PATH = BOT_DIR / "polygrok-week2-5000.db"
 LOG_DIR = HOME / "Library" / "Application Support" / "com.polygrok.bot"
 OUT_LOG = LOG_DIR / "launchd.out.log"
 ERR_LOG = LOG_DIR / "launchd.err.log"
 AGENT_LABEL = "com.polygrok.bot"
-START_BANKROLL = 50.0
-KILL_FLOOR = 40.0
-DAILY_LOSS_BUDGET = 2.50
+# Week-2 $5k cohort
+START_BANKROLL = 5000.0
+KILL_FLOOR = 4500.0
+WEEKLY_STOP = 4750.0
+DAILY_LOSS_BUDGET = 50.0
+AI_SESSION_BUDGET_USD = 10.0
+ESTIMATED_USD_PER_AI_CALL = 0.02  # estimated only
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 # Share marks across overlapping polls so the console doesn't stall.
 _MARKS_TTL_S = 3.0
@@ -55,10 +60,15 @@ def parse_ts(s: str | None) -> datetime | None:
         return None
 
 
+@contextmanager
 def connect() -> sqlite3.Connection:
+    """Always close — plain `with sqlite3.connect` leaks FDs on this Mac."""
     con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2)
     con.row_factory = sqlite3.Row
-    return con
+    try:
+        yield con
+    finally:
+        con.close()
 
 
 def _book_level_px(level: Any) -> float | None:
@@ -116,7 +126,7 @@ def live_marks_by_token(con: sqlite3.Connection) -> dict[str, Any]:
                 _MARKS_CACHE.update({"t": time.time(), "by_token": {}, "ok": False, "err": "no positions"})
                 return dict(_MARKS_CACHE)
         rows = con.execute(
-            "SELECT token_id, market_id, shares, avg_price FROM positions WHERE shares > 0"
+            "SELECT token_id, market_id, shares, avg_price FROM positions WHERE shares != 0"
         ).fetchall()
         by_token: dict[str, dict[str, Any]] = {}
         err: str | None = None
@@ -215,16 +225,36 @@ def tip_commit() -> str | None:
         return None
 
 
+
+def parse_regime_log(lines: list[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {"mode": None, "reason": None, "burn_usd": None, "source": "log"}
+    for line in reversed(lines or []):
+        if "REGIME mode=" not in line:
+            continue
+        m = re.search(r"REGIME mode=(\w+)\s+reason=(.+?)\s+burn=([0-9.]+)", line)
+        if m:
+            out["mode"] = m.group(1)
+            out["reason"] = m.group(2).strip()
+            try:
+                out["burn_usd"] = float(m.group(3))
+            except ValueError:
+                pass
+            break
+    return out
+
+
 def kill_line(equity: float, peak: float) -> dict[str, Any]:
     if peak <= START_BANKROLL:
         line = KILL_FLOOR
     else:
-        line = max(peak * 0.80, START_BANKROLL)
+        line = max(peak * 0.90, KILL_FLOOR)
     return {
         "kill_line": round(line, 2),
         "dollars_to_kill": round(equity - line, 2),
         "peak": round(peak, 2),
         "equity": round(equity, 2),
+        "weekly_stop": WEEKLY_STOP,
+        "dollars_to_weekly_stop": round(equity - WEEKLY_STOP, 2),
     }
 
 
@@ -605,7 +635,7 @@ def build_snapshot() -> dict[str, Any]:
         ).fetchall()
 
         open_pos = con.execute(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(ABS(shares*avg_price)),0) AS notional FROM positions WHERE shares > 0"
+            "SELECT COUNT(*) AS n, COALESCE(SUM(ABS(shares*avg_price)),0) AS notional FROM positions WHERE shares != 0"
             if _has_positions_cols(con)
             else "SELECT 0 AS n, 0 AS notional"
         ).fetchone()
@@ -715,11 +745,34 @@ def build_snapshot() -> dict[str, Any]:
     )
 
     kill = kill_line(equity, peak)
+
+    ai_calls = int(state["ai_call_count"]) if state and state["ai_call_count"] is not None else 0
+    regime = parse_regime_log(payload.get("logs", {}).get("out", []) or [])
+    est_burn = (
+        float(regime["burn_usd"])
+        if regime.get("burn_usd") is not None
+        else round(ai_calls * ESTIMATED_USD_PER_AI_CALL, 4)
+    )
+    ai_budget = {
+        "session_budget_usd": AI_SESSION_BUDGET_USD,
+        "estimated_usd_per_call": ESTIMATED_USD_PER_AI_CALL,
+        "ai_calls": ai_calls,
+        "ai_calls_utc_day": state["ai_calls_utc_day"] if state else None,
+        "estimated_burn_usd": est_burn,
+        "budget_remaining_usd": round(AI_SESSION_BUDGET_USD - est_burn, 4),
+        "regime_mode": regime.get("mode"),
+        "regime_reason": regime.get("reason"),
+        "fills": fills_n,
+        "unrealized_pnl": round(float(unrealized), 4),
+        "cost_is_estimated": True,
+        "as_of": utc_now().isoformat(),
+    }
+
     daily_pnl = realized - float(day_snap["realized_pnl"]) if day_snap else realized
 
     mix: Counter[str] = Counter()
     soft_n = hard_n = other_n = approved_n = 0
-    grok_n = gemini_n = 0
+    grok_n = gemini_n = micro_n = 0
     fee_edges_reject: list[float] = []
     fee_edges_ok: list[float] = []
     funnel = {
@@ -758,6 +811,8 @@ def build_snapshot() -> dict[str, Any]:
             grok_n += 1
         elif "gemini" in prov:
             gemini_n += 1
+        elif "micro" in prov.lower():
+            micro_n += 1
         # rough funnel. mid_outside_band is pre-AI: the model was not called.
         if nr not in (
             "research_failed",
@@ -869,33 +924,62 @@ def build_snapshot() -> dict[str, Any]:
     mode_s = (state["trading_mode"] if state else "paper")
     mtm_ts = utc_now().isoformat()
     executed = [_enrich_fill(r, mode_s) for r in fills_rows]
-    # Same CLOB mids as equity tile — per-row MTM every poll (open tickets only).
+    # Net from fills (BUY +, SELL −). Positions table can lag after a full exit
+    # (e.g. Sun/Dellavedova still showed LIVE) — fills are source of truth for CLOSED.
+    net_by_token: dict[str, float] = {}
+    for row_t in executed:
+        tid0 = str(row_t.get("token_id") or "")
+        if not tid0:
+            continue
+        sh0 = float(row_t.get("shares") or 0)
+        side0 = (row_t.get("side") or "BUY").upper()
+        net_by_token[tid0] = net_by_token.get(tid0, 0.0) + (sh0 if side0 == "BUY" else -sh0)
+
     for t in executed:
         tid = str(t.get("token_id") or "")
+        net = float(net_by_token.get(tid, 0.0))
+        closed = abs(net) <= 1e-6
+        side = (t.get("side") or "BUY").upper()
+        if closed:
+            t["live"] = False
+            t["status"] = "CLOSED"
+            t["mtm_live"] = False
+            t["mtm_ts"] = None
+            t["bid"] = None
+            t["ask"] = None
+            # Closed tickets: no open MTM (realized lives on the book realized_pnl).
+            t["unrealized"] = None
+            continue
+        # Still open — only the side that matches residual risk is LIVE.
+        is_live_side = (net > 0 and side == "BUY") or (net < 0 and side == "SELL")
+        if not is_live_side:
+            t["live"] = False
+            t["status"] = "CLOSED"
+            t["mtm_live"] = False
+            t["unrealized"] = None
+            continue
         m = by_token.get(tid) if by_token else None
         if not m or not m.get("live_book"):
+            t["live"] = True
+            t["status"] = "LIVE"
             t["mtm_live"] = False
             t["mtm_ts"] = None
             t["bid"] = None
             t["ask"] = None
             continue
         mark = float(m["mark"])
-        # Position avg/size so row unreal sums to portfolio unrealized.
-        entry = float(m["entry"])
-        shares = float(m["shares"])
-        side = (t.get("side") or "BUY").upper()
-        t["entry_price"] = entry
-        t["shares"] = shares
+        entry = float(t.get("entry_price") or m.get("entry") or 0)
+        shares = abs(net)  # residual open size
         t["mark"] = mark
         t["bid"] = m.get("bid")
         t["ask"] = m.get("ask")
-        t["size_usd"] = round(abs(shares) * entry, 4)
+        t["size_usd"] = round(shares * entry, 4)
         if side == "BUY":
             t["unrealized"] = round((mark - entry) * shares, 4)
         else:
             t["unrealized"] = round((entry - mark) * shares, 4)
-        t["live"] = abs(shares) > 1e-9
-        t["status"] = "LIVE" if t["live"] else "CLOSED"
+        t["live"] = True
+        t["status"] = "LIVE"
         t["mtm_live"] = True
         t["mtm_ts"] = mtm_ts
 
@@ -914,6 +998,8 @@ def build_snapshot() -> dict[str, Any]:
             "realized_pnl": realized,
             "unrealized_pnl": unrealized,
             "start_bankroll": START_BANKROLL,
+            "weekly_stop": WEEKLY_STOP,
+            "ai_budget": ai_budget,
             "equity_history": hist_pts,
             "exposure": exposure,
             "marks_live": marks_meta,
@@ -940,7 +1026,7 @@ def build_snapshot() -> dict[str, Any]:
             "other_rejects": other_n,
             "approved_2h": approved_n,
             "decisions_2h": len(decisions),
-            "provider_split": {"grok": grok_n, "gemini": gemini_n},
+            "provider_split": {"grok": grok_n, "gemini": gemini_n, "micro": micro_n},
             "provider_model_log": provider_model,
             "provider_latest_decision": latest_prov,
             "cascade_stage": cascade_stage,
@@ -1051,6 +1137,24 @@ function fmtDur(s){
   if(h) return `${h}h ${m}m`;
   return `${m}m ${s%60}s`;
 }
+/** Date + time in Asia/Calcutta for every KPI / table row. */
+function fmtTs(iso){
+  if(!iso) return '—';
+  const d = new Date(iso);
+  if(Number.isNaN(d.getTime())) return String(iso);
+  try{
+    return new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Calcutta',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false
+    }).format(d).replace(',', '') + ' IST';
+  }catch(e){
+    return d.toISOString();
+  }
+}
+function asOf(d){ return fmtTs(d.ts); }
+
 function clsMode(m){
   if(m==='PAPER') return 'ok';
   if(m==='HALTED') return 'bad';
@@ -1065,7 +1169,7 @@ function drawEquityChart(d){
   const W=canvas.width, H=canvas.height;
   ctx.clearRect(0,0,W,H);
   const hist=d.equity_history||[];
-  const start=Number(d.start_bankroll||50);
+  const start=Number(d.start_bankroll||5000);
   let pts=hist.map(p=>({t:Date.parse(p.ts), eq:Number(p.equity), cash:Number(p.cash), exp:Number(p.exposure||0)}));
   // always include latest point
   pts.push({t:Date.now(), eq:Number(d.equity), cash:Number(d.cash), exp:Number(d.exposure||0)});
@@ -1126,7 +1230,7 @@ async function tick(){
 }
 function render(d){
   const up = d.agent?.up;
-  $('sub').textContent = `refresh ${new Date(d.ts).toLocaleTimeString()} · query ${d.query_ms}ms · tip ${d.tip_commit||'?'} · loop age ${fmtDur(d.loop_age_s)}`;
+  $('sub').textContent = `as of ${fmtTs(d.ts)} · query ${d.query_ms}ms · tip ${d.tip_commit||'?'} · loop age ${fmtDur(d.loop_age_s)}`;
   $('headerPills').innerHTML = `
     <span class="pill"><span class="dot ${up?'on':'off'}"></span>LaunchAgent ${up?'UP':'DOWN'}${d.agent?.pid? ' · pid '+d.agent.pid:''}${d.agent?.etime? ' · '+d.agent.etime:''}</span>
     <span class="pill ${clsMode(d.mode)}">${esc(d.mode)}${d.halted? ' · '+esc(d.halt_reason||'halted'):''}</span>
@@ -1146,18 +1250,18 @@ function render(d){
   const mktCatHtml = bars(d.market_categories);
   const spreadHtml = bars(d.spread_buckets);
   const decCatHtml = bars(d.decision_categories_2h);
-  const rejRows = (d.last_5_rejects||[]).map(r=>`<tr><td>${esc((r.ts||'').slice(11,19))}</td><td class="accent">${esc(r.instrument||'—')}</td><td title="${esc(r.question||'')}">${esc((r.question||'—').slice(0,64))}</td><td>${esc((r.reject_reason||'').slice(0,36))}</td><td>${r.raw_edge??'—'}</td></tr>`).join('');
-  const mtmClock = (d.ts||'').slice(11,19) || new Date().toLocaleTimeString();
+  const rejRows = (d.last_5_rejects||[]).map(r=>`<tr><td>${fmtTs(r.ts)}</td><td class="accent">${esc(r.instrument||'—')}</td><td title="${esc(r.question||'')}">${esc((r.question||'—').slice(0,64))}</td><td>${esc((r.reject_reason||'').slice(0,36))}</td><td>${r.raw_edge??'—'}</td></tr>`).join('');
+  const mtmClock = fmtTs(d.ts);
   const tradeRows = (d.executed_trades||[]).map(t=>{
     const mark = t.mark!=null?Number(t.mark).toFixed(4):'—';
     const bid = t.bid!=null?Number(t.bid).toFixed(3):null;
     const ask = t.ask!=null?Number(t.ask).toFixed(3):null;
     const book = (bid!=null && ask!=null) ? `<div class="meta">${bid}/${ask}</div>` : '';
-    const unreal = t.unrealized!=null?((t.unrealized>=0?'+':'')+Number(t.unrealized).toFixed(4)):'—';
-    const mtm = t.mtm_live ? esc((t.mtm_ts||d.ts||'').slice(11,19)) : '—';
+    const unreal = (!t.live || t.unrealized==null) ? '—' : ((t.unrealized>=0?'+':'')+Number(t.unrealized).toFixed(4));
+    const mtm = t.mtm_live ? fmtTs(t.mtm_ts||d.ts) : '—';
     return `<tr data-fill="${t.fill_id??''}">
         <td>${t.fill_id??'—'}</td>
-        <td>${esc((t.ts||'').slice(11,19))}</td>
+        <td>${fmtTs(t.ts)}</td>
         <td class="accent">${esc(t.instrument||'—')}</td>
         <td title="${esc(t.question||'')}">${esc((t.question||'—').slice(0,48))}</td>
         <td>${esc(t.side||'')}</td>
@@ -1171,26 +1275,34 @@ function render(d){
         <td>${esc(t.mode||'PAPER')}</td>
       </tr>`;
   }).join('');
-  const liveRej = (d.recent_rejects||[]).map(r=>`<tr><td class="accent">${esc(r.instrument||'—')}</td><td title="${esc(r.question||'')}">${esc((r.question||'—').slice(0,72))}</td><td>${esc((r.reject_reason||'').slice(0,40))}</td></tr>`).join('');
-  const evRows = (d.events||[]).map(e=>`<tr><td>${esc((e.ts||'').slice(11,19))}</td><td>${esc(e.kind)}</td><td title="${esc(e.question||e.message||'')}">${esc((e.display||e.message||'').slice(0,90))}</td></tr>`).join('');
+  const liveRej = (d.recent_rejects||[]).map(r=>`<tr><td>${fmtTs(r.ts||d.ts)}</td><td class="accent">${esc(r.instrument||'—')}</td><td title="${esc(r.question||'')}">${esc((r.question||'—').slice(0,72))}</td><td>${esc((r.reject_reason||'').slice(0,40))}</td></tr>`).join('');
+  const evRows = (d.events||[]).map(e=>`<tr><td>${fmtTs(e.ts)}</td><td>${esc(e.kind)}</td><td title="${esc(e.question||e.message||'')}">${esc((e.display||e.message||'').slice(0,90))}</td></tr>`).join('');
   const f = d.funnel||{};
   const outLog = (d.logs?.out||[]).slice(-40).map(esc).join('\\n');
   const errLog = (d.logs?.err||[]).slice(-50).map(l=>`<span class="err">${esc(l)}</span>`).join('\\n');
   $('main').innerHTML = `
-    <div class="card"><h2>Cash / Equity</h2><div class="big">$${Number(d.cash).toFixed(2)} <span class="meta">/ $${Number(d.equity).toFixed(2)}</span></div>
-      <div class="meta">realized ${Number(d.realized_pnl).toFixed(2)} · unreal ${Number(d.unrealized_pnl).toFixed(4)} · peak $${Number(d.kill?.peak||0).toFixed(2)}</div></div>
-    <div class="card"><h2>$ to kill</h2><div class="big ${d.kill?.dollars_to_kill>5?'ok':(d.kill?.dollars_to_kill>2?'warn':'bad')}">$${Number(d.kill?.dollars_to_kill).toFixed(2)}</div>
-      <div class="meta">line $${Number(d.kill?.kill_line).toFixed(2)} · daily loss used $${Number(d.daily_loss_used).toFixed(2)} / $${d.daily_loss_budget}</div></div>
+    <div class="card"><h2>Portfolio (Equity)</h2><div class="big">$${Number(d.equity).toFixed(2)}</div>
+      <div class="meta">cash $${Number(d.cash).toFixed(2)} + open marks · <b>not</b> profit</div>
+      <div class="meta">closed PnL (realized) $${Number(d.realized_pnl).toFixed(2)} · open MTM (unrealized) $${Number(d.unrealized_pnl).toFixed(2)} · peak $${Number(d.kill?.peak||0).toFixed(2)}</div>
+      <div class="meta">as of ${asOf(d)}</div></div>
+    <div class="card"><h2>$ to kill</h2><div class="big ${d.kill?.dollars_to_kill>250?'ok':(d.kill?.dollars_to_kill>100?'warn':'bad')}">$${Number(d.kill?.dollars_to_kill).toFixed(2)}</div>
+      <div class="meta">line $${Number(d.kill?.kill_line).toFixed(2)} · weekly $${Number(d.kill?.weekly_stop||d.weekly_stop||0).toFixed(0)} · daily $${Number(d.daily_loss_used).toFixed(2)} / $${d.daily_loss_budget}</div>
+      <div class="meta">as of ${asOf(d)}</div></div>
+    <div class="card"><h2>AI budget</h2><div class="big ${(d.ai_budget?.regime_mode==='ATTACK')?'ok':(d.ai_budget?.regime_mode==='DEFEND'?'warn':'bad')}">${esc(d.ai_budget?.regime_mode||'—')} · $${Number(d.ai_budget?.estimated_burn_usd||0).toFixed(2)} / $${Number(d.ai_budget?.session_budget_usd||10).toFixed(0)}</div>
+      <div class="meta">est. · ${d.ai_budget?.ai_calls||0} calls · left $${Number(d.ai_budget?.budget_remaining_usd||0).toFixed(2)} · ${esc(d.ai_budget?.regime_reason||'')}</div>
+      <div class="meta">as of ${fmtTs(d.ai_budget?.as_of||d.ts)}</div></div>
     <div class="card"><h2>Fills + PnL</h2><div class="big">${d.fills} fills</div>
-      <div class="meta">open pos ${d.open_positions} · notional $${Number(d.open_notional).toFixed(2)} · approved 2h ${d.approved_2h}</div></div>
+      <div class="meta">open pos ${d.open_positions} · notional $${Number(d.open_notional).toFixed(2)} · approved 2h ${d.approved_2h}</div>
+      <div class="meta">as of ${asOf(d)}</div></div>
     <div class="card"><h2>Paper lock</h2><div class="big">${fmtDur(d.paper_lock_remaining_s)}</div>
-      <div class="meta">started ${esc(d.paper_started_at||'—')}</div></div>
+      <div class="meta">started ${fmtTs(d.paper_started_at)} · as of ${asOf(d)}</div></div>
 
-    <div class="card full"><h2>Equity live · dotted line = start bankroll $${Number(d.start_bankroll||50).toFixed(0)}</h2>
+    <div class="card full"><h2>Equity live · dotted line = start bankroll $${Number(d.start_bankroll||5000).toFixed(0)}</h2>
+      <div class="meta">as of ${asOf(d)}</div>
       <div class="chart-wrap"><canvas id="equityChart" width="1100" height="180"></canvas></div>
-      <div class="meta" style="margin-top:6px">blue = equity · grey = cash · dotted amber = start $50 · unreal ${Number(d.unrealized_pnl||0).toFixed(4)} · in market ${Number(d.exposure||0).toFixed(2)} · marks ${d.marks_live?.ok?('LIVE '+ (d.marks_live.fetched||0)+'/'+(d.marks_live.open||0)):'DB'}</div>
+      <div class="meta" style="margin-top:6px">blue = equity · grey = cash · dotted amber = start bankroll · unreal ${Number(d.unrealized_pnl||0).toFixed(4)} · in market ${Number(d.exposure||0).toFixed(2)} · marks ${d.marks_live?.ok?('LIVE '+ (d.marks_live.fetched||0)+'/'+(d.marks_live.open||0)):'DB'}</div>
     </div>
-    <div class="card wide"><h2>Edge funnel (2h)</h2>
+    <div class="card wide"><h2>Edge funnel (2h)</h2><div class="meta">as of ${asOf(d)}</div>
       <div class="funnel">
         <div><strong>${f.candidates||0}</strong><span>candidates</span></div>
         <div><strong>${f.estimates_ok||0}</strong><span>est OK</span></div>
@@ -1200,10 +1312,11 @@ function render(d){
       </div>
       <div class="meta" style="margin-top:8px">avg fee-edge rejects ${d.avg_fee_edge_rejects??'—'} · approvals ${d.avg_fee_edge_approvals??'—'}</div>
     </div>
-    <div class="card wide"><h2>Provider health</h2>
+    <div class="card wide"><h2>Provider health</h2><div class="meta">as of ${asOf(d)}</div>
       <div class="row" style="margin-bottom:6px">
         <span class="pill">Grok ${d.provider_split?.grok||0}</span>
         <span class="pill">Gemini ${d.provider_split?.gemini||0}</span>
+        <span class="pill">Micro ${d.provider_split?.micro||0}</span>
         <span class="pill">cascade ${esc(d.cascade_stage||'—')}</span>
         <span class="pill">parse-miss ${d.parse_miss_rate==null?'—':(100*d.parse_miss_rate).toFixed(0)+'%'} (${d.gemini_attempts_window||0} att)</span>
       </div>
@@ -1211,30 +1324,30 @@ function render(d){
       <div class="meta">${esc(d.provider_model_log||'')}</div>
     </div>
 
-    <div class="card"><h2>Markets by category</h2><div class="barwrap">${mktCatHtml}</div></div>
-    <div class="card"><h2>Decisions 2h by category</h2><div class="barwrap">${decCatHtml}</div></div>
-    <div class="card"><h2>Rejected spread width (2h)</h2><div class="barwrap">${spreadHtml}</div>
+    <div class="card"><h2>Markets by category</h2><div class="meta">as of ${asOf(d)}</div><div class="barwrap">${mktCatHtml}</div></div>
+    <div class="card"><h2>Decisions 2h by category</h2><div class="meta">as of ${asOf(d)}</div><div class="barwrap">${decCatHtml}</div></div>
+    <div class="card"><h2>Rejected spread width (2h)</h2><div class="meta">as of ${asOf(d)}</div><div class="barwrap">${spreadHtml}</div>
       <div class="meta">buckets from gates.spread_width / TRADE_REJECTED · n=${d.spread_bucket_total||0}</div></div>
-    <div class="card wide"><h2>Reject mix (2h)</h2><div class="barwrap">${mixHtml}</div></div>
-    <div class="card full"><h2>Executed trades · MTM ${d.marks_live?.ok?'LIVE':'DB'} @ ${mtmClock}</h2>
+    <div class="card wide"><h2>Reject mix (2h)</h2><div class="meta">as of ${asOf(d)}</div><div class="barwrap">${mixHtml}</div></div>
+    <div class="card full"><h2>Executed trades · MTM ${d.marks_live?.ok?'LIVE':'DB'} · as of ${mtmClock}</h2>
       <table><thead><tr>
-        <th>#</th><th>fill ts</th><th>inst</th><th>question</th><th>side</th>
+        <th>#</th><th>entry date · time</th><th>inst</th><th>question</th><th>side</th>
         <th>entry</th><th>mark</th><th>unreal</th><th>mtm</th><th>size</th><th>dec</th><th>status</th><th>mode</th>
       </tr></thead>
       <tbody>${tradeRows||'<tr><td colspan=13 class="meta">no fills yet</td></tr>'}</tbody></table>
     </div>
-    <div class="card wide"><h2>Last rejects — instrument · question · reason</h2>
-      <table><thead><tr><th>ts</th><th>inst</th><th>question</th><th>reason</th><th>raw</th></tr></thead><tbody>${rejRows||'<tr><td colspan=5>—</td></tr>'}</tbody></table>
+    <div class="card wide"><h2>Last rejects — instrument · question · reason</h2><div class="meta">as of ${asOf(d)}</div>
+      <table><thead><tr><th>date · time</th><th>inst</th><th>question</th><th>reason</th><th>raw</th></tr></thead><tbody>${rejRows||'<tr><td colspan=5>—</td></tr>'}</tbody></table>
     </div>
-    <div class="card wide"><h2>Live REJECT log</h2>
-      <table><thead><tr><th>inst</th><th>question</th><th>reason</th></tr></thead><tbody>${liveRej||'<tr><td colspan=3 class="meta">waiting for REJECT instrument=… lines after bounce</td></tr>'}</tbody></table>
+    <div class="card wide"><h2>Live REJECT log</h2><div class="meta">as of ${asOf(d)}</div>
+      <table><thead><tr><th>date · time</th><th>inst</th><th>question</th><th>reason</th></tr></thead><tbody>${liveRej||'<tr><td colspan=3 class="meta">waiting for REJECT instrument=… lines after bounce</td></tr>'}</tbody></table>
     </div>
 
     <div class="card wide"><h2>stdout · launchd.out.log</h2><div class="console">${outLog}</div></div>
     <div class="card wide"><h2>stderr · launchd.err.log</h2><div class="console">${errLog}</div></div>
 
-    <div class="card full"><h2>system_events</h2>
-      <table><thead><tr><th>ts</th><th>kind</th><th>instrument · reason · question</th></tr></thead><tbody>${evRows}</tbody></table>
+    <div class="card full"><h2>system_events</h2><div class="meta">as of ${asOf(d)}</div>
+      <table><thead><tr><th>date · time</th><th>kind</th><th>instrument · reason · question</th></tr></thead><tbody>${evRows}</tbody></table>
     </div>
   `;
   drawEquityChart(d);
