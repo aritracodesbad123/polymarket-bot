@@ -31,6 +31,16 @@ def cmd_status(app: TradingApp) -> int:
         print("live_blockers: " + ", ".join(auth.reasons))
     print(f"cash: {app.paper.cash:.2f} reserved: {app.paper.reserved:.2f}")
     print(f"equity: {app.paper.equity():.2f}")
+    print(
+        f"ai_burn_utc_day: {st.ai_calls_utc_day or '-'} "
+        f"calls={st.ai_call_count}"
+    )
+    base = "-" if st.week_baseline_equity is None else f"{st.week_baseline_equity:.2f}"
+    print(f"week_started_on: {st.week_started_on or '-'} baseline={base}")
+    print(
+        f"daily_realized_pnl: {st.daily_realized_pnl:.4f} "
+        f"day={st.daily_pnl_utc_day or '-'}"
+    )
     return 0
 
 
@@ -240,6 +250,14 @@ def cmd_resume_paper(app: TradingApp) -> int:
     return 0
 
 
+def cmd_reset_week_baseline(app: TradingApp) -> int:
+    """Intentional weekly baseline reset to current equity. Does not clear a halt."""
+    equity = app.paper.equity()
+    app.regime.reset_week_baseline(equity)
+    print(f"week baseline reset to {equity:.2f} (halt unchanged)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m app.cli")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -257,6 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
     act.add_argument("--confirmation", default=None)
     sub.add_parser("kill")
     sub.add_parser("resume-paper")
+    sub.add_parser("reset-week-baseline")
     return p
 
 
@@ -291,6 +310,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_kill(app)
     if args.cmd == "resume-paper":
         return cmd_resume_paper(app)
+    if args.cmd == "reset-week-baseline":
+        return cmd_reset_week_baseline(app)
     return 2
 
 

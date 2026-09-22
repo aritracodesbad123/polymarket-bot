@@ -52,3 +52,25 @@ def test_regime_die_on_kill_floor():
     # floor = 50 * 0.8 = 40
     st = eng.update(equity=39.0, unrealized_pnl=0.0)
     assert st.mode == "DIE"
+    assert st.reason.startswith("kill_floor")
+
+
+def test_zero_burn_startup_not_die_first_paid_call_is():
+    """Cushion 0 is burn >= profit, but 0 burn and 0 profit must not DIE."""
+    eng = RegimeEngine(
+        _settings(api_die_cushion_usd=0.0, estimated_usd_per_ai_call=0.02)
+    )
+    st = eng.update(equity=50.0, unrealized_pnl=0.0)
+    assert st.mode == "ATTACK"
+    assert eng.session_ai_cost_usd == 0.0
+    eng.note_ai_call(1)  # 0.02 >= profit 0
+    st = eng.update(equity=50.0, unrealized_pnl=0.0)
+    assert st.mode == "DIE"
+    assert st.reason.startswith("api_burn")
+    # Profit that covers the call does not DIE.
+    eng2 = RegimeEngine(
+        _settings(api_die_cushion_usd=0.0, estimated_usd_per_ai_call=0.02)
+    )
+    eng2.note_ai_call(1)
+    covered = eng2.update(equity=50.03, unrealized_pnl=0.0)
+    assert covered.mode != "DIE"

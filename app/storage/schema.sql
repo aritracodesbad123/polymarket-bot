@@ -11,6 +11,15 @@ CREATE TABLE IF NOT EXISTS system_state (
     trading_mode TEXT NOT NULL DEFAULT 'paper',
     live_activated_at TEXT,
     consecutive_losses INTEGER NOT NULL DEFAULT 0,
+    -- Day-scoped AI burn (UTC date + call count). Cost = count * ESTIMATED_USD_PER_AI_CALL.
+    ai_calls_utc_day TEXT,
+    ai_call_count INTEGER NOT NULL DEFAULT 0,
+    -- Weekly equity stop baseline. week_started_on is the Monday (UTC) of that week.
+    week_started_on TEXT,
+    week_baseline_equity REAL,
+    -- Day-scoped realized P&L for the absolute daily-loss cap.
+    daily_pnl_utc_day TEXT,
+    daily_realized_pnl REAL NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

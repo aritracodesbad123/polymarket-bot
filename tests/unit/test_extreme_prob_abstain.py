@@ -32,10 +32,13 @@ def test_exact_zero_abstains():
     assert out.should_abstain is True
 
 
-def test_near_extreme_does_not_auto_abstain():
-    # Soft extremes used to force grok_abstain and burned the Gemini paper run.
+def test_survival_lock_abstains_outside_2_98_band():
+    # Gemini Survival lock: p < 0.02 or p > 0.98 abstains. Do not loosen.
     out = _eng()._finish(_est(0.01), EvidencePacket(market_id="m1", question="q", resolution_criteria="r"))
-    assert out.should_abstain is False
+    assert out.should_abstain is True
+    assert "extreme_probability" in out.abstention_reason
+    inside = _eng()._finish(_est(0.03), EvidencePacket(market_id="m1", question="q", resolution_criteria="r"))
+    assert inside.should_abstain is False
 
 
 def test_mid_range_ok():

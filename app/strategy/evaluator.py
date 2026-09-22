@@ -9,6 +9,7 @@ from app.config import Settings
 from app.market_data.models import Market, OrderBook
 from app.market_data.orderbook import FillEstimate, walk_book
 from app.research.researcher import EvidencePacket
+from app.risk.caps import position_notional_cap, total_exposure_cap
 
 
 TAKER_FEE_RATE = {
@@ -198,11 +199,12 @@ class StrategyEvaluator:
             return _fail(gates, "duplicate_order", **base)
 
         size_usd = kelly_f * bankroll
-        size_usd = min(size_usd, s.max_position_pct_bankroll * bankroll)
+        # Percentage caps stay. Optional absolute USD caps take the stricter limit.
+        size_usd = min(size_usd, position_notional_cap(s, bankroll))
         size_usd = min(size_usd, max(0.0, s.max_market_exposure_pct * bankroll - existing_market_exposure))
         size_usd = min(size_usd, max(0.0, s.max_category_exposure_pct * bankroll - existing_category_exposure))
         size_usd = min(size_usd, max(0.0, s.max_correlation_group_exposure_pct * bankroll - existing_group_exposure))
-        size_usd = min(size_usd, max(0.0, s.max_total_exposure_pct * bankroll - existing_total_exposure))
+        size_usd = min(size_usd, max(0.0, total_exposure_cap(s, bankroll) - existing_total_exposure))
         size_usd = min(size_usd, cash)
 
         if canary:

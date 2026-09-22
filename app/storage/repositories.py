@@ -4,9 +4,15 @@ import json
 import sqlite3
 from typing import Any
 
-from app.storage.db import Database
+from app.storage.db import Database, DatabaseError
 from app.storage.models import SystemState
 from app.storage import utcnow
+
+
+def _require(row: sqlite3.Row, name: str):
+    if name not in row.keys():
+        raise DatabaseError(f"system_state_missing_column:{name}")
+    return row[name]
 
 
 class Repositories:
@@ -30,6 +36,16 @@ class Repositories:
             trading_mode=row["trading_mode"],
             live_activated_at=row["live_activated_at"],
             consecutive_losses=int(row["consecutive_losses"] or 0),
+            ai_calls_utc_day=_require(row, "ai_calls_utc_day"),
+            ai_call_count=int(_require(row, "ai_call_count") or 0),
+            week_started_on=_require(row, "week_started_on"),
+            week_baseline_equity=(
+                None
+                if _require(row, "week_baseline_equity") is None
+                else float(row["week_baseline_equity"])
+            ),
+            daily_pnl_utc_day=_require(row, "daily_pnl_utc_day"),
+            daily_realized_pnl=float(_require(row, "daily_realized_pnl") or 0.0),
         )
 
     def mark_paper_started(self) -> None:
@@ -72,6 +88,72 @@ class Repositories:
         self.db.execute(
             "UPDATE system_state SET consecutive_losses=?, updated_at=? WHERE id=1",
             (n, utcnow()),
+        )
+
+    def _state_row(self) -> sqlite3.Row:
+        self.state()
+        row = self.db.query_one("SELECT * FROM system_state WHERE id = 1")
+        if row is None:
+            raise DatabaseError("system_state_missing")
+        return row
+
+    def _update_state(self, sql: str, params: tuple) -> None:
+        self.db.execute(sql, params)
+        row = self.db.query_one("SELECT id FROM system_state WHERE id = 1")
+        if row is None:
+            raise DatabaseError("system_state_update_failed")
+
+    def ai_burn_state(self) -> tuple[str | None, int]:
+        row = self._state_row()
+        day = _require(row, "ai_calls_utc_day")
+        count = _require(row, "ai_call_count")
+        return (None if day is None else str(day), int(count or 0))
+
+    def set_ai_burn(self, day: str, count: int) -> None:
+        if not day or count < 0:
+            raise DatabaseError("ai_burn_invalid")
+        self._update_state(
+            """UPDATE system_state SET ai_calls_utc_day=?, ai_call_count=?, updated_at=?
+               WHERE id=1""",
+            (day, int(count), utcnow()),
+        )
+
+    def week_baseline_state(self) -> tuple[str | None, float | None]:
+        row = self._state_row()
+        started = _require(row, "week_started_on")
+        base = _require(row, "week_baseline_equity")
+        return (
+            None if started is None else str(started),
+            None if base is None else float(base),
+        )
+
+    def set_week_baseline(self, started_on: str, equity: float) -> None:
+        if not started_on or equity < 0:
+            raise DatabaseError("week_baseline_invalid")
+        self._update_state(
+            """UPDATE system_state SET week_started_on=?, week_baseline_equity=?, updated_at=?
+               WHERE id=1""",
+            (started_on, float(equity), utcnow()),
+        )
+
+    def daily_realized_state(self) -> tuple[str | None, float]:
+        row = self._state_row()
+        day = _require(row, "daily_pnl_utc_day")
+        pnl = _require(row, "daily_realized_pnl")
+        return (None if day is None else str(day), float(pnl or 0.0))
+
+    def set_daily_realized(self, day: str, pnl: float) -> None:
+        if not day:
+            raise DatabaseError("daily_realized_invalid")
+        self._update_state(
+            """UPDATE system_state SET daily_pnl_utc_day=?, daily_realized_pnl=?, updated_at=?
+               WHERE id=1""",
+            (day, float(pnl), utcnow()),
+        )
+
+    def latest_portfolio(self):
+        return self.db.query_one(
+            "SELECT * FROM portfolio_snapshots ORDER BY id DESC LIMIT 1"
         )
 
     def event(self, kind: str, message: str, payload: dict | None = None) -> None:

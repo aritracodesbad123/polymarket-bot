@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 
 from app.config import Settings
+from app.risk.caps import daily_loss_cap_usd, position_notional_cap, total_exposure_cap
+from app.risk.regime import utc_day
+from app.storage.db import DatabaseError
 from app.storage.repositories import Repositories
 
 
@@ -44,14 +49,24 @@ class KillSwitch:
 
 
 class RiskManager:
-    def __init__(self, settings: Settings, repo: Repositories) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        repo: Repositories,
+        *,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
         self.repo = repo
         self.kill = KillSwitch(repo)
+        self._now = now or (lambda: datetime.now(timezone.utc))
         self._api_failures = 0
         self._stale_hits = 0
         self.daily_pnl = 0.0
+        self.daily_realized_pnl = 0.0
+        self._daily_day = utc_day(self._now()).isoformat()
         self.peak_equity: float | None = None
+        self._load_daily_realized()
 
     def note_api_failure(self) -> None:
         self._api_failures += 1
@@ -79,6 +94,97 @@ class RiskManager:
 
     def note_recon_mismatch(self, detail: str) -> None:
         self.kill.trigger(f"reconciliation_mismatch:{detail}")
+
+    def _today(self) -> str:
+        return utc_day(self._now()).isoformat()
+
+    def _load_daily_realized(self) -> None:
+        try:
+            day, pnl = self.repo.daily_realized_state()
+        except DatabaseError:
+            raise
+        today = self._today()
+        if day is None:
+            if pnl != 0:
+                raise DatabaseError("daily_realized_without_day")
+            self._daily_day = today
+            self.daily_realized_pnl = 0.0
+            return
+        try:
+            parsed = date.fromisoformat(day)
+        except ValueError as exc:
+            raise DatabaseError("daily_realized_day_invalid") from exc
+        today_d = date.fromisoformat(today)
+        if parsed > today_d:
+            raise DatabaseError("daily_realized_day_in_future")
+        if parsed < today_d:
+            self._daily_day = today
+            self.daily_realized_pnl = 0.0
+            self._persist_daily()
+        else:
+            self._daily_day = today
+            self.daily_realized_pnl = pnl
+        self.enforce_daily_realized_cap()
+
+    def _roll_daily(self) -> None:
+        today = self._today()
+        if today == self._daily_day:
+            return
+        self._daily_day = today
+        self.daily_realized_pnl = 0.0
+        self._persist_daily()
+
+    def _persist_daily(self) -> None:
+        try:
+            self.repo.set_daily_realized(self._daily_day, self.daily_realized_pnl)
+        except DatabaseError:
+            try:
+                if not self.repo.state().halted:
+                    self.repo.halt("daily_realized_persist_failed")
+            except DatabaseError:
+                pass
+            raise
+
+    def note_realized_pnl(self, delta: float) -> None:
+        """Add day-scoped realized P&L and enforce the absolute/percentage cap."""
+        self._roll_daily()
+        self.daily_realized_pnl += delta
+        self._persist_daily()
+        self.enforce_daily_realized_cap()
+
+    def enforce_daily_realized_cap(self) -> None:
+        """Halt when today's realized loss reaches the stricter configured cap.
+
+        No-op when MAX_DAILY_LOSS_USD is unset. Does not clear an existing halt
+        and does not replace the percentage equity check in note_equity.
+        """
+        self._roll_daily()
+        if self.repo.state().halted:
+            return
+        limit = daily_loss_cap_usd(self.settings, self.settings.paper_starting_bankroll)
+        if limit is None:
+            return
+        loss = -self.daily_realized_pnl
+        if self.daily_realized_pnl < 0 and loss >= limit:
+            self.kill.trigger(f"daily_realized_loss_cap:{loss:.4f}>={limit:.4f}")
+
+    def order_block_reason(
+        self,
+        *,
+        size_usd: float,
+        existing_total_exposure: float,
+        bankroll: float,
+    ) -> str | None:
+        """Execution-path refusal. Stricter of percentage and absolute caps."""
+        if self.repo.state().halted:
+            return "halted"
+        pos_cap = position_notional_cap(self.settings, bankroll)
+        if size_usd > pos_cap + 1e-6:
+            return "position_usd_cap"
+        exp_cap = total_exposure_cap(self.settings, bankroll)
+        if existing_total_exposure + size_usd > exp_cap + 1e-6:
+            return "exposure_usd_cap"
+        return None
 
     def note_equity(self, equity: float, start_bankroll: float) -> None:
         if self.peak_equity is None:

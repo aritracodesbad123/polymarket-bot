@@ -141,7 +141,7 @@ class TradingApp:
         self.portfolio = Portfolio(self.paper, self.repo)
         self.portfolio.hydrate_paper(settings.paper_starting_bankroll)
         self.risk = RiskManager(settings, self.repo)
-        self.regime = RegimeEngine(settings)
+        self.regime = RegimeEngine(settings, self.repo)
         self.strategy = StrategyEvaluator(settings)
         self.telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
         self.stop = False
@@ -197,6 +197,7 @@ class TradingApp:
         self.repo.event("AI_PROVIDER", msg)
 
     async def cycle(self) -> None:
+        self.risk.enforce_daily_realized_cap()
         st = self.repo.state()
         if st.halted:
             return
@@ -426,6 +427,7 @@ class TradingApp:
                 self.repo.event("HOLDING_EXIT_FAIL", f"{verdict.reason}|{err}")
                 continue
             delta = self.paper.realized_pnl - before_pnl
+            self.risk.note_realized_pnl(delta)
             if delta >= 0:
                 self.risk.note_win()
             else:
@@ -632,6 +634,19 @@ class TradingApp:
                 self.repo.event(
                     "TRADE_REJECTED",
                     f"{ident['instrument']} | {decision.reject_reason or ''} | {ident['question'][:80]}",
+                    ident,
+                )
+                continue
+            block = self.risk.order_block_reason(
+                size_usd=decision.size_usd,
+                existing_total_exposure=exp.total,
+                bankroll=self.settings.paper_starting_bankroll,
+            )
+            if block:
+                self.cycle_stats["rejected"] += 1
+                self.repo.event(
+                    "TRADE_REJECTED",
+                    f"{ident['instrument']} | {block} | {ident['question'][:80]}",
                     ident,
                 )
                 continue
