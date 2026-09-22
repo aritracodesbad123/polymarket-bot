@@ -9,7 +9,7 @@ from app.config import Settings
 from app.market_data.models import Market, OrderBook
 from app.market_data.orderbook import FillEstimate, walk_book
 from app.research.researcher import EvidencePacket
-from app.risk.caps import position_notional_cap, total_exposure_cap
+from app.risk.caps import add_breaches_cap, position_notional_cap, total_exposure_cap
 
 
 TAKER_FEE_RATE = {
@@ -117,6 +117,7 @@ class StrategyEvaluator:
         canary: bool = False,
         open_positions: int = 0,
         canary_day_notional: float = 0.0,
+        existing_position_cost: float = 0.0,
         min_edge: float | None = None,
         kelly_multiplier: float | None = None,
         min_confidence_score: float | None = None,
@@ -200,11 +201,16 @@ class StrategyEvaluator:
 
         size_usd = kelly_f * bankroll
         # Percentage caps stay. Optional absolute USD caps take the stricter limit.
-        size_usd = min(size_usd, position_notional_cap(s, bankroll))
+        # New entries are clipped to the position cap here. Adds are not resized
+        # to the leftover room — a buy that would finish above the cap is
+        # rejected in full below.
+        pos_cap = position_notional_cap(s, bankroll)
+        exp_cap = total_exposure_cap(s, bankroll)
+        size_usd = min(size_usd, pos_cap)
         size_usd = min(size_usd, max(0.0, s.max_market_exposure_pct * bankroll - existing_market_exposure))
         size_usd = min(size_usd, max(0.0, s.max_category_exposure_pct * bankroll - existing_category_exposure))
         size_usd = min(size_usd, max(0.0, s.max_correlation_group_exposure_pct * bankroll - existing_group_exposure))
-        size_usd = min(size_usd, max(0.0, total_exposure_cap(s, bankroll) - existing_total_exposure))
+        size_usd = min(size_usd, max(0.0, exp_cap - existing_total_exposure))
         size_usd = min(size_usd, cash)
 
         if canary:
@@ -224,6 +230,23 @@ class StrategyEvaluator:
 
         if size_usd <= 0:
             return _fail(gates, "size_zero_after_limits", **base, grok_p=p, market_price=px, raw_edge=raw_edge, kelly=kelly_f)
+
+        # Fail closed on adds. Do not clip to the leftover dollars under the cap.
+        if add_breaches_cap(existing_position_cost, size_usd, pos_cap):
+            g(
+                "position_usd_cap",
+                False,
+                f"cost={existing_position_cost:.4f} add={size_usd:.4f} cap={pos_cap:.4f} policy=reject_add",
+            )
+            return _fail(
+                gates,
+                "position_usd_cap",
+                **base,
+                grok_p=p,
+                market_price=px,
+                raw_edge=raw_edge,
+                kelly=kelly_f,
+            )
 
         shares = size_usd / px
         if shares < market.min_order_size:
@@ -248,6 +271,46 @@ class StrategyEvaluator:
 
         size_shares = fill.filled_shares
         size_usd = fill.notional
+        # Walked fills can print above the pre-trade clip. Reject the order
+        # rather than submit a notional that finishes through the cap.
+        if add_breaches_cap(existing_position_cost, size_usd, pos_cap):
+            g(
+                "position_usd_cap",
+                False,
+                f"cost={existing_position_cost:.4f} fill={size_usd:.4f} cap={pos_cap:.4f} policy=reject_add",
+            )
+            return _fail(
+                gates,
+                "position_usd_cap",
+                **base,
+                grok_p=p,
+                market_price=px,
+                raw_edge=raw_edge,
+                execution_adjusted_edge=exec_edge,
+                kelly=kelly_f,
+                fill=fill,
+                token_id=token_id,
+                side=side,
+            )
+        if add_breaches_cap(existing_total_exposure, size_usd, exp_cap):
+            g(
+                "exposure_usd_cap",
+                False,
+                f"exposure={existing_total_exposure:.4f} fill={size_usd:.4f} cap={exp_cap:.4f}",
+            )
+            return _fail(
+                gates,
+                "exposure_usd_cap",
+                **base,
+                grok_p=p,
+                market_price=px,
+                raw_edge=raw_edge,
+                execution_adjusted_edge=exec_edge,
+                kelly=kelly_f,
+                fill=fill,
+                token_id=token_id,
+                side=side,
+            )
         return Decision(
             approved=True,
             reject_reason=None,

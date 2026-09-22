@@ -413,19 +413,104 @@ def _decide(s: Settings, **kw):
     return StrategyEvaluator(s).evaluate(**args)
 
 
-def test_absolute_position_cap_stricter_than_pct(tmp_path):
-    s = settings(
-        tmp_path,
+def _cohort_caps(tmp_path, **kw) -> Settings:
+    base = dict(
         paper_starting_bankroll=5000.0,
         max_position_pct_bankroll=0.03,
         max_position_usd=25.0,
         max_total_exposure_pct=0.25,
         max_total_exposure_usd=500.0,
+        min_edge=0.05,
+        max_spread=0.06,
+        kelly_multiplier=0.25,
     )
+    base.update(kw)
+    return settings(tmp_path, **base)
+
+
+def _thin_walk_book():
+    """Top of book is 10 shares; the next level is inside the 2% slip cap."""
+    from app.market_data.models import BookLevel, OrderBook
+
+    return OrderBook(
+        token_id="yes1",
+        market_id="m1",
+        bids=[BookLevel(price=0.38, size=5000)],
+        asks=[
+            BookLevel(price=0.40, size=10),
+            BookLevel(price=0.404, size=5000),
+        ],
+    )
+
+
+def test_absolute_position_cap_stricter_than_pct(tmp_path):
+    s = _cohort_caps(tmp_path)
     d = _decide(s)
     assert d.approved
+    assert d.side == "BUY"
     assert d.size_usd <= 25.0 + 1e-6
     assert d.size_usd > 20.0
+
+
+def test_addon_at_cap_rejected_without_clip_or_sell(tmp_path):
+    """Policy: an add that would finish above $25 is rejected in full.
+
+    It is not clipped to the leftover room, and an already-oversize ticket
+    is not turned into a sell.
+    """
+    s = _cohort_caps(tmp_path)
+    assert s.min_edge == 0.05
+    assert s.max_spread == 0.06
+    assert s.kelly_multiplier == 0.25
+
+    at_cap = _decide(s, existing_position_cost=25.0)
+    assert not at_cap.approved
+    assert at_cap.reject_reason == "position_usd_cap"
+    assert at_cap.side is None
+    assert at_cap.size_usd == 0
+
+    # Cash binds the order at $10. Cost $20 + $10 finishes at $30.
+    # Leftover room is $5; the add is rejected, not resized to $5.
+    ten = _decide(s, existing_position_cost=20.0, cash=10.0)
+    assert not ten.approved
+    assert ten.reject_reason == "position_usd_cap"
+    assert ten.size_usd == 0
+    assert ten.side is None
+
+    over = _decide(s, existing_position_cost=25.89)
+    assert not over.approved
+    assert over.reject_reason == "position_usd_cap"
+    assert over.side is None
+
+    # Room remains: cost $20 + $4 add stays under $25.
+    fits = _decide(s, existing_position_cost=20.0, cash=4.0)
+    assert fits.approved
+    assert fits.size_usd == pytest.approx(4.0)
+    assert 20.0 + fits.size_usd <= 25.0 + 1e-6
+
+    # Entry gates stay put.
+    assert _decide(s, estimate=estimate(0.44)).reject_reason == "edge_too_small"
+    assert _decide(s, book=book(bid=0.30)).reject_reason == "spread_too_wide"
+
+
+def test_walked_fill_cannot_soft_overshoot_position_or_exposure(tmp_path):
+    s = _cohort_caps(tmp_path)
+    thin = _thin_walk_book()
+    # Pre-trade size is $25 at the ask; the walk prints above $25 inside the slip cap.
+    new_entry = _decide(s, book=thin)
+    assert not new_entry.approved
+    assert new_entry.reject_reason == "position_usd_cap"
+
+    # Cost $15 + cash-capped $10 fits before the walk and not after. Reject the add.
+    add = _decide(s, book=thin, existing_position_cost=15.0, cash=10.0)
+    assert not add.approved
+    assert add.reject_reason == "position_usd_cap"
+    assert add.size_usd == 0
+
+    # Exposure still clips to the leftover $10, then rejects when the walk exceeds $500.
+    exposed = _decide(s, book=thin, existing_total_exposure=490.0)
+    assert not exposed.approved
+    assert exposed.reject_reason == "exposure_usd_cap"
 
 
 def test_pct_position_cap_stricter_than_absolute(tmp_path):
@@ -500,6 +585,30 @@ def test_order_block_reason_uses_stricter_cap(tmp_path):
     assert (
         rm.order_block_reason(size_usd=10, existing_total_exposure=0, bankroll=5000)
         is None
+    )
+    assert (
+        rm.order_block_reason(
+            size_usd=1, existing_total_exposure=0, bankroll=5000, existing_position_cost=25
+        )
+        == "position_usd_cap"
+    )
+    assert (
+        rm.order_block_reason(
+            size_usd=10, existing_total_exposure=0, bankroll=5000, existing_position_cost=20
+        )
+        == "position_usd_cap"
+    )
+    assert (
+        rm.order_block_reason(
+            size_usd=4, existing_total_exposure=0, bankroll=5000, existing_position_cost=20
+        )
+        is None
+    )
+    assert (
+        rm.order_block_reason(
+            size_usd=10, existing_total_exposure=495, bankroll=5000, existing_position_cost=0
+        )
+        == "exposure_usd_cap"
     )
 
 
@@ -628,6 +737,170 @@ async def test_executor_enforces_absolute_caps(tmp_path):
     )
     err = await ex.execute(near_cap, 2)
     assert err == "exposure_usd_cap"
+
+
+def _executor(tmp_path):
+    from app.broker.live import LiveBroker
+    from app.execution.executor import Executor
+    from app.market_data.client import PolymarketClient
+
+    s = _cohort_caps(tmp_path)
+    _d, repo = db(tmp_path)
+    paper = PaperBroker(5000.0, 0)
+    live = LiveBroker(s, repo)
+    data = PolymarketClient(s.polymarket_gamma_url, s.polymarket_api_url, s.polymarket_ws_url)
+
+    async def fake_book(*_a, **_k):
+        return book()
+
+    data.get_order_book = fake_book  # type: ignore
+    return Executor(s, repo, paper, live, data), paper, repo
+
+
+def _buy(market_id: str, token_id: str, shares: float, price: float = 0.40):
+    from app.strategy.evaluator import Decision
+
+    return Decision(
+        approved=True,
+        reject_reason=None,
+        gates=[],
+        market_id=market_id,
+        token_id=token_id,
+        side="BUY",
+        limit_price=price,
+        market_price=price,
+        size_shares=shares,
+        size_usd=shares * price,
+    )
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_addon_past_position_cap(tmp_path):
+    from app.broker.models import OrderRequest
+    from app.broker.paper import Resting
+
+    ex, paper, repo = _executor(tmp_path)
+    paper._positions["falcons"] = PaperPosition(
+        token_id="falcons",
+        market_id="m-falcons",
+        shares=64.725,
+        avg_price=0.40,
+    )
+    assert paper._positions["falcons"].shares * 0.40 == pytest.approx(25.89)
+    err = await ex.execute(_buy("m-falcons", "falcons", 2.5), 1)
+    assert err == "position_usd_cap"
+    assert paper._positions["falcons"].shares == pytest.approx(64.725)
+    assert repo.orders() == []
+
+    paper._positions["room"] = PaperPosition(
+        token_id="room",
+        market_id="m-room",
+        shares=50.0,
+        avg_price=0.40,
+    )
+    err = await ex.execute(_buy("m-room", "room", 25.0), 2)
+    assert err == "position_usd_cap"
+    assert paper._positions["room"].shares == pytest.approx(50.0)
+
+    paper._positions["yes1"] = PaperPosition(
+        token_id="yes1",
+        market_id="m-rest",
+        shares=40.0,
+        avg_price=0.50,
+    )
+    paper.resting["r1"] = Resting(
+        req=OrderRequest(
+            client_order_id="r1",
+            idempotency_key="rest-key",
+            market_id="m-rest",
+            token_id="yes1",
+            side="BUY",
+            price=0.50,
+            size_shares=10.0,
+        ),
+        remaining=10.0,
+        created_at=0.0,
+    )
+    err = await ex.execute(_buy("m-rest", "yes1", 2.5), 3)
+    assert err == "position_usd_cap"
+    assert paper._positions["yes1"].shares == pytest.approx(40.0)
+
+    async def unreadable():
+        raise RuntimeError("positions down")
+
+    paper.positions = unreadable  # type: ignore
+    err = await ex.execute(_buy("m-blind", "blind", 10.0), 4)
+    assert err == "position_usd_cap"
+    assert "blind" not in paper._positions
+
+
+@pytest.mark.asyncio
+async def test_executor_new_entry_and_fitting_add_stay_at_or_under_cap(tmp_path):
+    from app.strategy.evaluator import Decision
+
+    ex, paper, _repo = _executor(tmp_path)
+    err = await ex.execute(_buy("m-new", "yes-new", 62.5), 1)
+    assert err is None
+    opened = paper._positions["yes-new"]
+    assert opened.shares * opened.avg_price == pytest.approx(25.0)
+    assert opened.shares * opened.avg_price <= 25.0 + 1e-6
+
+    paper._positions["fit"] = PaperPosition(
+        token_id="fit",
+        market_id="m-fit",
+        shares=50.0,
+        avg_price=0.40,
+    )
+    err = await ex.execute(_buy("m-fit", "fit", 10.0), 2)
+    assert err is None
+    held = paper._positions["fit"]
+    assert held.shares * held.avg_price == pytest.approx(24.0)
+    assert held.shares * held.avg_price <= 25.0 + 1e-6
+
+    # Cap does not flatten and does not block an exit.
+    paper._positions["falcons"] = PaperPosition(
+        token_id="falcons",
+        market_id="m-falcons",
+        shares=64.725,
+        avg_price=0.40,
+    )
+    sell = Decision(
+        approved=True,
+        reject_reason=None,
+        gates=[],
+        market_id="m-falcons",
+        token_id="falcons",
+        side="SELL",
+        limit_price=0.38,
+        market_price=0.38,
+        size_shares=1.0,
+        size_usd=0.38,
+    )
+    err = await ex.execute(sell, 3, kind="exit")
+    assert err != "position_usd_cap"
+    assert err is None
+    assert paper._positions["falcons"].shares == pytest.approx(63.725)
+
+
+@pytest.mark.asyncio
+async def test_executor_exposure_cap_on_add(tmp_path):
+    ex, paper, _repo = _executor(tmp_path)
+    paper._positions["other"] = PaperPosition(
+        token_id="other",
+        market_id="m-other",
+        shares=495.0,
+        avg_price=1.0,
+    )
+    err = await ex.execute(_buy("m-add", "yes-add", 25.0), 1)
+    assert err == "exposure_usd_cap"
+    assert "yes-add" not in paper._positions
+    assert paper._positions["other"].shares == pytest.approx(495.0)
+
+    err = await ex.execute(_buy("m-fit", "yes-fit", 10.0), 2)
+    assert err is None
+    opened = paper._positions["yes-fit"]
+    assert opened.shares * opened.avg_price == pytest.approx(4.0)
+    assert paper.exposure() <= 500.0 + 1e-6
 
 
 def test_optional_caps_from_env(monkeypatch, tmp_path):

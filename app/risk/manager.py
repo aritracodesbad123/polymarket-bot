@@ -5,7 +5,12 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
 from app.config import Settings
-from app.risk.caps import daily_loss_cap_usd, position_notional_cap, total_exposure_cap
+from app.risk.caps import (
+    add_breaches_cap,
+    daily_loss_cap_usd,
+    position_notional_cap,
+    total_exposure_cap,
+)
 from app.risk.regime import utc_day
 from app.storage.db import DatabaseError
 from app.storage.repositories import Repositories
@@ -176,15 +181,22 @@ class RiskManager:
         size_usd: float,
         existing_total_exposure: float,
         bankroll: float,
+        existing_position_cost: float = 0.0,
     ) -> str | None:
-        """Execution-path refusal. Stricter of percentage and absolute caps."""
+        """Execution-path refusal. Stricter of percentage and absolute caps.
+
+        ``existing_position_cost`` is the token cost basis (plus resting BUY
+        reserve) the order would add to. Adds that would finish above the
+        position cap are rejected in full. Total exposure uses the same
+        fail-closed comparison on ``existing_total_exposure + size_usd``.
+        """
         if self.repo.state().halted:
             return "halted"
         pos_cap = position_notional_cap(self.settings, bankroll)
-        if size_usd > pos_cap + 1e-6:
+        if add_breaches_cap(existing_position_cost, size_usd, pos_cap):
             return "position_usd_cap"
         exp_cap = total_exposure_cap(self.settings, bankroll)
-        if existing_total_exposure + size_usd > exp_cap + 1e-6:
+        if add_breaches_cap(existing_total_exposure, size_usd, exp_cap):
             return "exposure_usd_cap"
         return None
 

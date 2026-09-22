@@ -33,6 +33,7 @@ from app.monitoring.logging import setup_logging
 from app.monitoring.telegram import Telegram
 from app.portfolio.portfolio import Portfolio
 from app.research.researcher import EvidencePacket, NullResearchProvider, XAISearchProvider
+from app.risk.caps import position_cost_from_rows
 from app.risk.manager import RiskManager, exposure_from_positions
 from app.risk.regime import (
     RegimeEngine,
@@ -829,6 +830,9 @@ class TradingApp:
                 self.settings.strategy_version,
             )
             duplicate = self.repo.get_order_by_idempotency(key) is not None
+            token_cost = position_cost_from_rows(positions, book.token_id) + self.paper.resting_buy_usd(
+                book.token_id
+            )
             decision = self.strategy.evaluate(
                 market=m,
                 book=book,
@@ -846,6 +850,7 @@ class TradingApp:
                 data_fresh=True,
                 canary=canary,
                 open_positions=len(positions),
+                existing_position_cost=token_cost,
                 **gemini_kw,
             )
             ident = self._market_identity(m)
@@ -901,6 +906,7 @@ class TradingApp:
                 size_usd=decision.size_usd,
                 existing_total_exposure=exp.total,
                 bankroll=self.settings.paper_starting_bankroll,
+                existing_position_cost=token_cost,
             )
             if block:
                 self.cycle_stats["rejected"] += 1
