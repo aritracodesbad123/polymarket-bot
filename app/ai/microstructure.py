@@ -7,7 +7,7 @@ Phase 1 fair value (replaces the Phase 0 half-spread cap):
 
     microprice m* = (bid_size * ask + ask_size * bid) / (bid_size + ask_size)
     imbalance  I  = (bid_size - ask_size) / (bid_size + ask_size)  in [-1, 1]
-    Δ̂            = λ × I          λ = MICRO_LAMBDA (default 0.04)
+    Δ̂            = λ × I          λ = MICRO_LAMBDA (default 0.08)
     fair          = clip(mid + Δ̂, 0.01, 0.99)
 
 ``m*`` and ``I`` are telemetry and inputs. Fair value is the clipped
@@ -69,7 +69,7 @@ from app.strategy.evaluator import fee_per_share, quarter_kelly
 # Same number as the Survival confidence floor. Never lowered.
 MICRO_MIN_CONFIDENCE = 0.50
 MICRO_PROVIDER = "micro"
-MICRO_LAMBDA_DEFAULT = 0.04
+MICRO_LAMBDA_DEFAULT = 0.08
 MICRO_MIN_ABS_I = 0.40
 # Touch shares must be at least this many times the intended order.
 MICRO_TOUCH_MULTIPLE = 3.0

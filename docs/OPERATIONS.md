@@ -82,11 +82,11 @@ Before research or `engine.estimate`, the fresh book mid must lie in `[MIN_TRADE
 
 ```bash
 ESTIMATOR=microstructure
-MICRO_LAMBDA=0.04
+MICRO_LAMBDA=0.08
 MICRO_MIN_ABS_I=0.40
 ```
 
-Phase 1 fair value is `clip(mid + MICRO_LAMBDA × imbalance, 0.01, 0.99)`. Microprice and imbalance are still computed and logged; they are not the fair value, and `|fair − mid|` is not capped at the half-spread. `|imbalance|` below `MICRO_MIN_ABS_I` rejects as `micro_weak_imbalance`. The touch (top-of-book size on the side that would trade) must be at least 3× the intended order or the quote rejects as `micro_thin_touch`. Intended size is the quarter-Kelly share count when bankroll is known (capped by the position limit and cash). Otherwise it is `MAX_POSITION_USD / mid`, or the position-cap notional divided by mid. `ask − bid` still has to satisfy `MAX_SPREAD` on the existing book filter. Default `MICRO_LAMBDA=0.04` is a 4¢ shift at `|I|=1`, which does not by itself clear `MIN_EDGE=0.05` after the spread and fees. Raising `MICRO_LAMBDA` is the knob for that; `MIN_EDGE` stays put.
+Phase 1 fair value is `clip(mid + MICRO_LAMBDA × imbalance, 0.01, 0.99)`. Microprice and imbalance are still computed and logged; they are not the fair value, and `|fair − mid|` is not capped at the half-spread. `|imbalance|` below `MICRO_MIN_ABS_I` rejects as `micro_weak_imbalance`. The touch (top-of-book size on the side that would trade) must be at least 3× the intended order or the quote rejects as `micro_thin_touch`. Intended size is the quarter-Kelly share count when bankroll is known (capped by the position limit and cash). Otherwise it is `MAX_POSITION_USD / mid`, or the position-cap notional divided by mid. `ask − bid` still has to satisfy `MAX_SPREAD` on the existing book filter. Phase 1b default `MICRO_LAMBDA=0.08` is an 8¢ shift at `|I|=1`. `MICRO_MIN_ABS_I` stays `0.40`. `MIN_EDGE` stays `0.05`; it is not lowered. `MICRO_LAMBDA` in the environment still overrides the default.
 
 Week boundary is Monday 00:00 UTC. The baseline is the equity at the first cycle of that week and is stored in `system_state`. It resets only on that boundary or via `python -m app.cli reset-week-baseline` (does not clear HALTED). `resume-paper` does not move it.
 
