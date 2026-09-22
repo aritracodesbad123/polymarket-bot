@@ -26,7 +26,7 @@ def test_defaults():
     assert s.min_tradeable_mid == 0.10
     assert s.max_tradeable_mid == 0.90
     assert s.estimator is None
-    assert s.micro_lambda == 0.04
+    assert s.micro_lambda == 0.08
     assert s.micro_min_abs_imbalance == 0.40
     assert s.weekly_loss_pct is None
     assert s.max_position_usd is None
@@ -76,7 +76,7 @@ def test_micro_phase1_env(monkeypatch, tmp_path):
     monkeypatch.delenv("MICRO_LAMBDA", raising=False)
     monkeypatch.delenv("MICRO_MIN_ABS_I", raising=False)
     blank = Settings.from_env(dotenv_path=tmp_path / "none.env")
-    assert blank.micro_lambda == 0.04
+    assert blank.micro_lambda == 0.08
     assert blank.micro_min_abs_imbalance == 0.40
 
     monkeypatch.setenv("MICRO_LAMBDA", "0.12")

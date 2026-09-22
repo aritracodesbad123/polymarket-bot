@@ -114,7 +114,7 @@ async def test_budget_die_screens_via_micro_and_logs_provider(tmp_path, caplog):
     payload = json.loads(events[0]["payload_json"])
     assert payload["provider"] == MICRO_PROVIDER
     assert payload["imbalance"] == pytest.approx(0.6)
-    assert payload["lambda"] == pytest.approx(0.04)
+    assert payload["lambda"] == pytest.approx(0.08)
     assert payload["microprice"] is not None
     preds = app.repo.db.query(
         "SELECT model, should_abstain, confidence_score FROM ai_predictions"

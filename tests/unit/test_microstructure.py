@@ -74,35 +74,35 @@ def test_zero_size_fails_closed_without_dividing():
     assert est.snapshots("m1") == []
 
 
-def test_lambda_moves_mid_four_cents_and_fair_can_leave_the_spread():
-    """λ=0.04 at |I|=1 is a 4¢ shift. That shift is not pulled back to the spread."""
-    assert MICRO_LAMBDA_DEFAULT == 0.04
+def test_lambda_moves_mid_eight_cents_and_fair_can_leave_the_spread():
+    """λ=0.08 at |I|=1 is an 8¢ shift. That shift is not pulled back to the spread."""
+    assert MICRO_LAMBDA_DEFAULT == 0.08
     bid, ask = 0.40, 0.42
     mid = 0.41
-    hi = fair_value(bid, ask, 5, 0, lam=0.04)
-    lo = fair_value(bid, ask, 0, 5, lam=0.04)
-    assert hi == pytest.approx(mid + 0.04)
-    assert lo == pytest.approx(mid - 0.04)
-    # Half-spread is 1¢, so the uncapped 4¢ shift sits outside the quotes.
+    hi = fair_value(bid, ask, 5, 0, lam=0.08)
+    lo = fair_value(bid, ask, 0, 5, lam=0.08)
+    assert hi == pytest.approx(mid + 0.08)
+    assert lo == pytest.approx(mid - 0.08)
+    # Half-spread is 1¢, so the uncapped 8¢ shift sits outside the quotes.
     assert hi > ask
     assert lo < bid
     # Telemetry only: microprice is still the size-weighted quote, not fair.
     assert microprice(bid, ask, 5, 0) == pytest.approx(ask)
     assert hi != pytest.approx(microprice(bid, ask, 5, 0))
 
-    # A wider spread can still contain the 4¢ shift. That is the displacement,
-    # not a half-spread cap.
-    wide = fair_value(0.40, 0.50, 5, 0, lam=0.04)
-    assert wide == pytest.approx(0.45 + 0.04)
-    assert 0.40 < wide < 0.50
+    # A wider spread can still contain the 8¢ shift. That is the displacement,
+    # not a half-spread cap. Half-spread here is 10¢.
+    wide = fair_value(0.40, 0.60, 5, 0, lam=0.08)
+    assert wide == pytest.approx(0.50 + 0.08)
+    assert 0.40 < wide < 0.60
 
 
 def test_fair_clips_outside_one_cent_to_ninety_nine_cents():
-    hi = fair_value(0.96, 0.98, 10, 0, lam=0.04)
-    assert (0.96 + 0.98) / 2 + 0.04 > 0.99
+    hi = fair_value(0.96, 0.98, 10, 0, lam=0.08)
+    assert (0.96 + 0.98) / 2 + 0.08 > 0.99
     assert hi == pytest.approx(0.99)
-    lo = fair_value(0.02, 0.04, 0, 10, lam=0.04)
-    assert (0.02 + 0.04) / 2 - 0.04 < 0.01
+    lo = fair_value(0.02, 0.04, 0, 10, lam=0.08)
+    assert (0.02 + 0.04) / 2 - 0.08 < 0.01
     assert lo == pytest.approx(0.01)
 
 
@@ -136,8 +136,8 @@ def test_weak_imbalance_rejects_and_boundary_passes():
     assert rejected.estimate is None
     assert rejected.imbalance == pytest.approx(0.2)
     assert rejected.microprice is not None
-    assert rejected.fair == pytest.approx(0.41 + 0.04 * 0.2)
-    assert rejected.displacement == pytest.approx(0.04 * 0.2)
+    assert rejected.fair == pytest.approx(0.41 + 0.08 * 0.2)
+    assert rejected.displacement == pytest.approx(0.08 * 0.2)
     # The quote was real, so it still enters the stability window.
     assert len(est.snapshots("m1")) == 1
 
@@ -165,20 +165,21 @@ def test_weak_imbalance_rejects_and_boundary_passes():
 
 
 def test_fee_aware_edge_clears_min_edge_when_imbalance_is_strong():
-    """MIN_EDGE stays 0.05. A strong imbalance can clear it; a 4¢ shift does not."""
+    """MIN_EDGE stays 0.05. Default λ=0.08 at |I|=1 is an 8¢ shift and clears it here."""
     min_edge = 0.05
     bid, ask = 0.48, 0.50
     mid = (bid + ask) / 2.0
     fee = fee_per_share(ask, "geopolitics")
     assert fee == 0.0
-    # Default λ at |I|=1 is +4¢. After the half-spread the fee-aware edge is short.
+    # Default λ at |I|=1 is +8¢. Half-spread is 1¢, so the fee-aware edge is 7¢.
     fair_default = fair_value(bid, ask, 10, 0, lam=MICRO_LAMBDA_DEFAULT)
-    assert fair_default == pytest.approx(mid + 0.04)
+    assert fair_default == pytest.approx(mid + 0.08)
     assert fair_default > ask
     edge_default = buy_yes_edge(fair_default, ask, fee)
     assert edge_default == pytest.approx(fair_default - ask)
-    assert edge_default < min_edge
-    assert select_side(edge_default, -1.0, min_edge) is None
+    assert edge_default == pytest.approx(0.07)
+    assert edge_default >= min_edge
+    assert select_side(edge_default, -1.0, min_edge) == "BUY_YES"
 
     # Same formula, a larger λ. |I|=0.40 misses MIN_EDGE; |I|=1 clears it.
     mild = fair_value(bid, ask, 7, 3, lam=0.12)
@@ -233,22 +234,24 @@ def test_confidence_proxy_and_components():
 
 
 def test_estimator_confidence_edge_and_snapshot_window():
-    # |I| = 0.8 so the quote is not a weak-imbalance reject. λ=0.04 still
-    # leaves the fee-aware edge under MIN_EDGE.
+    # |I| = 0.8 so the quote is not a weak-imbalance reject. Default λ=0.08
+    # puts the raw edge over MIN_EDGE; the politics fee pulls it back under,
+    # so the estimate abstains.
     deep = book(bid=0.40, ask=0.42, bid_size=9_000, ask_size=1_000)
     est = MicrostructureEstimator(min_edge=0.05, max_spread=0.06, min_liquidity=500)
     first = est.estimate(deep, market_id="m1", category="politics")
     assert first.reject_reason is None
     assert first.estimate is not None
     assert first.imbalance == pytest.approx(0.8)
-    assert first.fair == pytest.approx(0.41 + 0.04 * 0.8)
+    assert first.fair == pytest.approx(0.41 + 0.08 * 0.8)
     assert first.confidence_score is not None
     assert first.confidence_score >= MICRO_MIN_CONFIDENCE
     assert first.stability == 0.0  # only one snapshot
     assert first.side is None
     assert first.buy_yes_edge is not None and first.buy_yes_edge < 0.05
     assert first.sell_no_edge is not None and first.sell_no_edge < 0.05
-    assert first.estimate.should_abstain is False
+    assert first.estimate.should_abstain is True
+    assert first.estimate.abstention_reason == "micro_edge"
     assert first.estimate.estimated_probability == pytest.approx(first.fair)
     assert "not an event forecast" in first.estimate.reasoning_summary
 
@@ -292,7 +295,7 @@ def test_positive_imbalance_prefers_buy_yes_when_min_edge_is_negative():
     assert result.side == "BUY_YES"
     assert result.estimate is not None
     assert result.estimate.should_abstain is False
-    assert result.fair == pytest.approx(0.41 + 0.04 * 0.8)
+    assert result.fair == pytest.approx(0.41 + 0.08 * 0.8)
     assert result.fair > 0.42
 
 
@@ -342,7 +345,7 @@ def test_estimator_abstains_when_fees_hide_a_clearing_raw_edge(tmp_path):
 
 
 def test_strong_imbalance_clears_unchanged_min_edge(tmp_path):
-    """A larger λ can trade. The default 4¢ shift still dies on MIN_EDGE."""
+    """A larger λ can trade. λ=0.04 on this book still dies on unchanged MIN_EDGE."""
     s = settings(tmp_path)
     assert s.min_edge == 0.05
     assert s.kelly_multiplier == 0.25
@@ -532,7 +535,7 @@ def test_position_cap_proxy_matches_sizing_helper(tmp_path):
 
 
 def test_strategy_pipeline_still_rejects_micro_quotes(tmp_path):
-    """Same Survival gates. A 4¢ shift on a 2¢-wide book does not clear MIN_EDGE."""
+    """Same Survival gates. Default λ=0.08 on this politics book abstains and is not approved."""
     s = settings(tmp_path)
     assert s.kelly_multiplier == 0.25
     assert s.max_spread == 0.06
@@ -542,6 +545,7 @@ def test_strategy_pipeline_still_rejects_micro_quotes(tmp_path):
     deep = book(bid=0.40, ask=0.42, bid_size=9_000, ask_size=1_000)
     result = MicrostructureEstimator().estimate(deep, market_id="m1", category="politics")
     assert result.estimate is not None
+    assert result.estimate.should_abstain is True
     assert result.fair is not None and result.fair > 0.42
     decision = StrategyEvaluator(s).evaluate(
         market=market(),
@@ -561,7 +565,7 @@ def test_strategy_pipeline_still_rejects_micro_quotes(tmp_path):
         min_confidence_score=MICRO_MIN_CONFIDENCE,
     )
     assert decision.approved is False
-    assert decision.reject_reason == "edge_too_small"
+    assert decision.reject_reason == "grok_abstain"
 
     wide = book(bid=0.40, ask=0.50, bid_size=9_000, ask_size=1_000)
     assert filter_book(wide, s) == "spread_too_wide"
