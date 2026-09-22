@@ -25,6 +25,9 @@ Extra hard filters on this path only. Survival gates are not loosened
 
 * ``|I| >= MICRO_MIN_ABS_I`` (default 0.40). Weaker books reject
   ``micro_weak_imbalance``.
+* Book mid in ``[MICRO_COIN_FLIP_MIN, MICRO_COIN_FLIP_MAX]`` (defaults
+  0.45–0.55 inclusive) rejects ``micro_coin_flip_mid``. New micro entries
+  only; shared ``MIN_TRADEABLE_MID`` / Gemini path unchanged.
 * ``ask - bid <= MAX_SPREAD`` stays on the existing book filter and
   ``StrategyEvaluator``. This module does not open a wider spread.
 * Touch size (shares at the top of the side we would take) must be at least
@@ -71,6 +74,10 @@ MICRO_MIN_CONFIDENCE = 0.50
 MICRO_PROVIDER = "micro"
 MICRO_LAMBDA_DEFAULT = 0.08
 MICRO_MIN_ABS_I = 0.40
+# Inclusive coin-flip mid band. Micro new entries only.
+MICRO_COIN_FLIP_MIN = 0.45
+MICRO_COIN_FLIP_MAX = 0.55
+MICRO_COIN_FLIP_REJECT = "micro_coin_flip_mid"
 # Touch shares must be at least this many times the intended order.
 MICRO_TOUCH_MULTIPLE = 3.0
 FAIR_CLIP_LO = 0.01
@@ -390,6 +397,8 @@ class MicrostructureEstimator:
         min_liquidity: float = 500.0,
         lam: float = MICRO_LAMBDA_DEFAULT,
         min_abs_imbalance: float = MICRO_MIN_ABS_I,
+        coin_flip_min: float = MICRO_COIN_FLIP_MIN,
+        coin_flip_max: float = MICRO_COIN_FLIP_MAX,
         bankroll: float | None = None,
         cash: float | None = None,
         kelly_multiplier: float = 0.25,
@@ -403,6 +412,8 @@ class MicrostructureEstimator:
         self.min_liquidity = min_liquidity
         self.lam = lam
         self.min_abs_imbalance = min_abs_imbalance
+        self.coin_flip_min = coin_flip_min
+        self.coin_flip_max = coin_flip_max
         self.bankroll = bankroll
         self.cash = cash
         self.kelly_multiplier = kelly_multiplier
@@ -481,6 +492,14 @@ class MicrostructureEstimator:
             lam=self.lam,
             displacement=delta,
         )
+
+        # Inclusive coin-flip band. Micro new entries only (this estimator).
+        if self.coin_flip_min <= mid <= self.coin_flip_max:
+            return MicrostructureResult(
+                estimate=None,
+                reject_reason=MICRO_COIN_FLIP_REJECT,
+                **common,
+            )
 
         if abs(imb) < self.min_abs_imbalance:
             return MicrostructureResult(

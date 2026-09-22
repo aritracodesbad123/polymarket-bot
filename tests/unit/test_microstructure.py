@@ -5,6 +5,9 @@ from __future__ import annotations
 import pytest
 
 from app.ai.microstructure import (
+    MICRO_COIN_FLIP_MAX,
+    MICRO_COIN_FLIP_MIN,
+    MICRO_COIN_FLIP_REJECT,
     MICRO_LAMBDA_DEFAULT,
     MICRO_MIN_ABS_I,
     MICRO_MIN_CONFIDENCE,
@@ -164,6 +167,54 @@ def test_weak_imbalance_rejects_and_boundary_passes():
     assert weak.reject_reason == "micro_weak_imbalance"
 
 
+def test_coin_flip_mid_rejects_and_outside_can_proceed():
+    """Inclusive [0.45, 0.55] blocks micro new entries. Outside can pass this gate."""
+    assert MICRO_COIN_FLIP_MIN == 0.45
+    assert MICRO_COIN_FLIP_MAX == 0.55
+    assert MICRO_COIN_FLIP_REJECT == "micro_coin_flip_mid"
+    est = MicrostructureEstimator()
+
+    # Mid 0.50 with strong |I| still dies on the coin-flip band first.
+    coin = OrderBook(
+        token_id="yes1",
+        market_id="m-coin",
+        bids=[BookLevel(price=0.49, size=9_000)],
+        asks=[BookLevel(price=0.51, size=1_000)],
+    )
+    assert (0.49 + 0.51) / 2.0 == pytest.approx(0.50)
+    assert imbalance(9_000, 1_000) == pytest.approx(0.8)
+    rejected = est.estimate(coin, market_id="m-coin", category="politics")
+    assert rejected.reject_reason == MICRO_COIN_FLIP_REJECT
+    assert rejected.estimate is None
+    assert rejected.imbalance == pytest.approx(0.8)
+    assert rejected.fair is not None
+
+    # Inclusive edges of the band.
+    lo = book(bid=0.44, ask=0.46, bid_size=9_000, ask_size=1_000)
+    hi = book(bid=0.54, ask=0.56, bid_size=9_000, ask_size=1_000)
+    assert lo.midpoint == pytest.approx(0.45)
+    assert hi.midpoint == pytest.approx(0.55)
+    assert (
+        est.estimate(lo, market_id="m-lo", category="politics").reject_reason
+        == MICRO_COIN_FLIP_REJECT
+    )
+    assert (
+        est.estimate(hi, market_id="m-hi", category="politics").reject_reason
+        == MICRO_COIN_FLIP_REJECT
+    )
+
+    # Mid 0.40 / 0.60 clear this gate (other gates may still reject later).
+    below = book(bid=0.39, ask=0.41, bid_size=9_000, ask_size=1_000)
+    above = book(bid=0.59, ask=0.61, bid_size=9_000, ask_size=1_000)
+    assert below.midpoint == pytest.approx(0.40)
+    assert above.midpoint == pytest.approx(0.60)
+    for mid_book, mid_id in ((below, "m-below"), (above, "m-above")):
+        held = est.estimate(mid_book, market_id=mid_id, category="politics")
+        assert held.reject_reason != MICRO_COIN_FLIP_REJECT
+        assert held.reject_reason is None
+        assert held.estimate is not None
+
+
 def test_fee_aware_edge_clears_min_edge_when_imbalance_is_strong():
     """MIN_EDGE stays 0.05. Default λ=0.08 at |I|=1 is an 8¢ shift and clears it here."""
     min_edge = 0.05
@@ -301,12 +352,13 @@ def test_positive_imbalance_prefers_buy_yes_when_min_edge_is_negative():
 
 def test_estimator_abstains_when_fees_hide_a_clearing_raw_edge(tmp_path):
     """Raw edge clears MIN_EDGE; the taker fee pulls the fee-aware edge under it."""
-    # I = 0.8, λ = 0.08, half-spread = 1¢ → raw edge ≈ 5.4¢. Crypto fee hides it.
+    # Mid 0.59 is outside the coin-flip band. I = 0.8, λ = 0.08, half-spread = 1¢
+    # → raw edge ≈ 5.4¢. Crypto fee hides it.
     strong = OrderBook(
         token_id="yes1",
         market_id="m-strong",
-        bids=[BookLevel(price=0.48, size=9_000)],
-        asks=[BookLevel(price=0.50, size=1_000)],
+        bids=[BookLevel(price=0.58, size=9_000)],
+        asks=[BookLevel(price=0.60, size=1_000)],
     )
     est = MicrostructureEstimator(
         min_edge=0.05,
@@ -321,7 +373,7 @@ def test_estimator_abstains_when_fees_hide_a_clearing_raw_edge(tmp_path):
     assert hidden.estimate.should_abstain is True
     assert hidden.estimate.abstention_reason == "micro_edge"
     assert hidden.buy_yes_edge is not None and hidden.buy_yes_edge < 0.05
-    assert hidden.fair is not None and (hidden.fair - 0.50) >= 0.05
+    assert hidden.fair is not None and (hidden.fair - 0.60) >= 0.05
     decision = StrategyEvaluator(settings(tmp_path, min_edge=0.05)).evaluate(
         market=market(category="crypto"),
         book=strong,
@@ -350,7 +402,7 @@ def test_strong_imbalance_clears_unchanged_min_edge(tmp_path):
     assert s.min_edge == 0.05
     assert s.kelly_multiplier == 0.25
     assert s.max_spread == 0.06
-    bid, ask = 0.48, 0.50
+    bid, ask = 0.38, 0.40
     strong_book = OrderBook(
         token_id="yes1",
         market_id="m1",
@@ -425,8 +477,8 @@ def test_strong_imbalance_clears_unchanged_min_edge(tmp_path):
 
 def test_thin_touch_uses_position_proxy_and_kelly_size():
     assert MICRO_TOUCH_MULTIPLE == 3.0
-    bid, ask = 0.48, 0.50
-    mid = 0.49
+    bid, ask = 0.38, 0.40
+    mid = 0.39
     # No bankroll: intended shares = MAX_POSITION_USD / mid.
     proxy_shares = 25.0 / mid
     thin = OrderBook(
@@ -472,11 +524,12 @@ def test_thin_touch_uses_position_proxy_and_kelly_size():
 
     # Kelly size when bankroll is known and the fraction is under the cap.
     # Complementary check on the bid uses the NO buy when I is negative.
+    # Mid 0.59 stays outside the coin-flip band.
     sell_book = OrderBook(
         token_id="yes1",
         market_id="m-sell",
-        bids=[BookLevel(price=0.50, size=10)],
-        asks=[BookLevel(price=0.52, size=10_000)],
+        bids=[BookLevel(price=0.58, size=10)],
+        asks=[BookLevel(price=0.60, size=10_000)],
     )
     kelly_est = MicrostructureEstimator(
         min_edge=0.05,
@@ -492,7 +545,7 @@ def test_thin_touch_uses_position_proxy_and_kelly_size():
     assert sold.side == "SELL_NO"
     assert sold.fair is not None
     no_p = 1.0 - sold.fair
-    no_px = 1.0 - 0.50
+    no_px = 1.0 - 0.58
     cap = position_cap_notional(1000, 0.03, None)
     kelly_notional = quarter_kelly(no_p, no_px, 0.25) * 1000
     assert 0 < kelly_notional < cap
@@ -504,11 +557,12 @@ def test_thin_touch_uses_position_proxy_and_kelly_size():
     assert sold.reject_reason == "micro_thin_touch"
 
     # A weak imbalance rejects before the touch check, even if the touch is thin.
+    # Mid outside the coin-flip band so the reason stays micro_weak_imbalance.
     both = OrderBook(
         token_id="yes1",
         market_id="m-both",
-        bids=[BookLevel(price=0.48, size=1)],
-        asks=[BookLevel(price=0.50, size=1)],
+        bids=[BookLevel(price=0.38, size=1)],
+        asks=[BookLevel(price=0.40, size=1)],
     )
     first = est.estimate(both, market_id="m-both", category="geopolitics")
     assert first.reject_reason == "micro_weak_imbalance"

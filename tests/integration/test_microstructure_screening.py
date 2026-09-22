@@ -7,7 +7,11 @@ import logging
 
 import pytest
 
-from app.ai.microstructure import MICRO_MIN_CONFIDENCE, MICRO_PROVIDER
+from app.ai.microstructure import (
+    MICRO_COIN_FLIP_REJECT,
+    MICRO_MIN_CONFIDENCE,
+    MICRO_PROVIDER,
+)
 from app.main import GEMINI_KELLY_MULTIPLIER, TradingApp
 from app.market_data.scanner import MID_OUTSIDE_BAND
 from tests.conftest import book, estimate, market, settings
@@ -172,6 +176,92 @@ async def test_balanced_book_rejects_weak_imbalance(tmp_path):
     assert payload["imbalance"] == pytest.approx(0.0)
     assert payload["microprice"] is not None
     assert payload["fair"] is not None
+
+
+@pytest.mark.asyncio
+async def test_coin_flip_mid_rejects_micro_entry(tmp_path):
+    """Mid 0.50 on the micro path rejects as micro_coin_flip_mid; LLM not called."""
+    app = TradingApp(
+        _budget_settings(
+            tmp_path,
+            estimator="microstructure",
+            db_path=str(tmp_path / "coin.db"),
+        )
+    )
+    eng = _Engine()
+    research = _Research()
+    app.engine = eng
+    app.research = research
+    # Strong |I|; would clear weak-imbalance. Mid sits in the coin-flip band.
+    calls = _wire(app, bid=0.49, ask=0.51, bid_size=9_000, ask_size=1_000)
+    assert book(bid=0.49, ask=0.51).midpoint == pytest.approx(0.50)
+    app.regime.note_ai_call(10)
+    await app.cycle()
+    assert calls["scan"] == 1
+    assert eng.calls == 0
+    assert research.calls == 0
+    assert app.repo.db.query("SELECT id FROM ai_predictions") == []
+    row = app.repo.db.query_one("SELECT reject_reason, gates_json FROM trade_decisions")
+    assert row["reject_reason"] == MICRO_COIN_FLIP_REJECT
+    gates = json.loads(row["gates_json"])
+    assert gates["ai_provider"]["detail"] == "micro"
+    assert app.settings.kelly_multiplier == 0.25
+    assert app.settings.min_edge == 0.05
+    assert app.settings.max_spread == 0.06
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bid,ask,mid", [(0.39, 0.41, 0.40), (0.59, 0.61, 0.60)])
+async def test_micro_outside_coin_flip_proceeds_past_gate(tmp_path, bid, ask, mid):
+    """Mid 0.40 / 0.60 clear micro_coin_flip_mid; other gates may still reject."""
+    app = TradingApp(
+        _budget_settings(
+            tmp_path,
+            estimator="microstructure",
+            db_path=str(tmp_path / f"outside-{mid}.db"),
+        )
+    )
+    eng = _Engine()
+    app.engine = eng
+    app.research = _Research()
+    calls = _wire(app, bid=bid, ask=ask, bid_size=9_000, ask_size=1_000)
+    assert book(bid=bid, ask=ask).midpoint == pytest.approx(mid)
+    app.regime.note_ai_call(10)
+    await app.cycle()
+    assert calls["scan"] == 1
+    assert eng.calls == 0
+    decisions = app.repo.db.query("SELECT reject_reason, gates_json FROM trade_decisions")
+    assert decisions
+    assert all(d["reject_reason"] != MICRO_COIN_FLIP_REJECT for d in decisions)
+    for row in decisions:
+        gates = json.loads(row["gates_json"])
+        assert gates["ai_provider"]["detail"] == "micro"
+
+
+@pytest.mark.asyncio
+async def test_llm_path_unaffected_by_coin_flip_mid(tmp_path):
+    """Shared mid band still allows 0.50 on the Gemini/LLM path."""
+    app = TradingApp(
+        _budget_settings(
+            tmp_path,
+            estimator=None,
+            db_path=str(tmp_path / "llm-coin.db"),
+        )
+    )
+    eng = _Engine()
+    research = _Research()
+    app.engine = eng
+    app.research = research
+    calls = _wire(app, bid=0.49, ask=0.51)
+    assert book(bid=0.49, ask=0.51).midpoint == pytest.approx(0.50)
+    await app.cycle()
+    assert calls["scan"] == 1
+    assert eng.calls == 1
+    assert research.calls == 1
+    assert app.regime.session_ai_calls == 1
+    decisions = app.repo.db.query("SELECT reject_reason FROM trade_decisions")
+    assert decisions
+    assert all(d["reject_reason"] != "micro_coin_flip_mid" for d in decisions)
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,8 @@ def test_defaults():
     assert s.estimator is None
     assert s.micro_lambda == 0.08
     assert s.micro_min_abs_imbalance == 0.40
+    assert s.micro_coin_flip_min == 0.45
+    assert s.micro_coin_flip_max == 0.55
     assert s.weekly_loss_pct is None
     assert s.max_position_usd is None
     assert s.max_total_exposure_usd is None
@@ -75,15 +77,23 @@ def test_estimator_from_env(monkeypatch, tmp_path):
 def test_micro_phase1_env(monkeypatch, tmp_path):
     monkeypatch.delenv("MICRO_LAMBDA", raising=False)
     monkeypatch.delenv("MICRO_MIN_ABS_I", raising=False)
+    monkeypatch.delenv("MICRO_COIN_FLIP_MIN", raising=False)
+    monkeypatch.delenv("MICRO_COIN_FLIP_MAX", raising=False)
     blank = Settings.from_env(dotenv_path=tmp_path / "none.env")
     assert blank.micro_lambda == 0.08
     assert blank.micro_min_abs_imbalance == 0.40
+    assert blank.micro_coin_flip_min == 0.45
+    assert blank.micro_coin_flip_max == 0.55
 
     monkeypatch.setenv("MICRO_LAMBDA", "0.12")
     monkeypatch.setenv("MICRO_MIN_ABS_I", "0.55")
+    monkeypatch.setenv("MICRO_COIN_FLIP_MIN", "0.48")
+    monkeypatch.setenv("MICRO_COIN_FLIP_MAX", "0.52")
     overridden = Settings.from_env(dotenv_path=tmp_path / "none.env")
     assert overridden.micro_lambda == 0.12
     assert overridden.micro_min_abs_imbalance == 0.55
+    assert overridden.micro_coin_flip_min == 0.48
+    assert overridden.micro_coin_flip_max == 0.52
 
 
 def test_gemini_key_stripped(monkeypatch, tmp_path):

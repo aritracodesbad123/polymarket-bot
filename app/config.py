@@ -116,6 +116,10 @@ class Settings(BaseModel):
     micro_lambda: float = 0.08
     # Reject microstructure quotes with a weaker absolute imbalance.
     micro_min_abs_imbalance: float = 0.40
+    # Inclusive mid band where micro refuses new entries (coin-flip). Not a
+    # Survival gate and not applied on the Gemini/LLM path.
+    micro_coin_flip_min: float = 0.45
+    micro_coin_flip_max: float = 0.55
     # DEFEND band only: equity under start by this much, unrealized worse than
     # -this, or burn past half of (profit + this). <=0 turns the band off.
     # It is not the session spend cap.
@@ -210,6 +214,8 @@ class Settings(BaseModel):
             estimator=_s("ESTIMATOR", "").lower() or None,
             micro_lambda=_f("MICRO_LAMBDA", 0.08),
             micro_min_abs_imbalance=_f("MICRO_MIN_ABS_I", 0.40),
+            micro_coin_flip_min=_f("MICRO_COIN_FLIP_MIN", 0.45),
+            micro_coin_flip_max=_f("MICRO_COIN_FLIP_MAX", 0.55),
             api_die_cushion_usd=_f("API_DIE_CUSHION_USD", 0.50),
             defend_edge_tighten=_f("DEFEND_EDGE_TIGHTEN", 0.02),
             defend_kelly_mult=_f("DEFEND_KELLY_MULT", 0.5),

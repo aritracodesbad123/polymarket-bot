@@ -162,6 +162,8 @@ class TradingApp:
             min_liquidity=settings.min_liquidity,
             lam=settings.micro_lambda,
             min_abs_imbalance=settings.micro_min_abs_imbalance,
+            coin_flip_min=settings.micro_coin_flip_min,
+            coin_flip_max=settings.micro_coin_flip_max,
             bankroll=settings.paper_starting_bankroll,
             kelly_multiplier=settings.kelly_multiplier,
             max_position_usd=settings.max_position_usd,
