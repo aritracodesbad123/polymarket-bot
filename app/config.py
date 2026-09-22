@@ -119,7 +119,7 @@ class Settings(BaseModel):
     # Phase 1 book fair: clip(mid + λ × imbalance, 0.01, 0.99). Not a Survival gate.
     micro_lambda: float = 0.08
     # Reject microstructure quotes with a weaker absolute imbalance.
-    micro_min_abs_imbalance: float = 0.40
+    micro_min_abs_imbalance: float = 0.55
     # Inclusive mid band where micro refuses new entries (coin-flip). Not a
     # Survival gate and not applied on the Gemini/LLM path.
     micro_coin_flip_min: float = 0.45
@@ -218,7 +218,7 @@ class Settings(BaseModel):
             estimator=_s("ESTIMATOR", "").lower() or None,
             estimator_auto_switch=_b("ESTIMATOR_AUTO_SWITCH", True),
             micro_lambda=_f("MICRO_LAMBDA", 0.08),
-            micro_min_abs_imbalance=_f("MICRO_MIN_ABS_I", 0.40),
+            micro_min_abs_imbalance=_f("MICRO_MIN_ABS_I", 0.55),
             micro_coin_flip_min=_f("MICRO_COIN_FLIP_MIN", 0.45),
             micro_coin_flip_max=_f("MICRO_COIN_FLIP_MAX", 0.55),
             api_die_cushion_usd=_f("API_DIE_CUSHION_USD", 0.50),

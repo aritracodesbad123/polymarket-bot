@@ -27,7 +27,7 @@ fair value above is what changed:
 Extra hard filters on this path only. Survival gates are not loosened
 (``MIN_EDGE``, ``MAX_SPREAD``, mid band, Kelly 0.25, kill, weekly, caps).
 
-* ``|I| >= MICRO_MIN_ABS_I`` (default 0.40). Weaker books reject
+* ``|I| >= MICRO_MIN_ABS_I`` (default 0.55). Weaker books reject
   ``micro_weak_imbalance``.
 * Book mid in ``[MICRO_COIN_FLIP_MIN, MICRO_COIN_FLIP_MAX]`` (defaults
   0.45–0.55 inclusive) rejects ``micro_coin_flip_mid``. New micro entries
@@ -77,7 +77,7 @@ from app.strategy.evaluator import fee_per_share, quarter_kelly
 MICRO_MIN_CONFIDENCE = 0.50
 MICRO_PROVIDER = "micro"
 MICRO_LAMBDA_DEFAULT = 0.08
-MICRO_MIN_ABS_I = 0.40
+MICRO_MIN_ABS_I = 0.55
 # Inclusive coin-flip mid band. Micro new entries only.
 MICRO_COIN_FLIP_MIN = 0.45
 MICRO_COIN_FLIP_MAX = 0.55
