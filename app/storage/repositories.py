@@ -474,6 +474,24 @@ class Repositories:
             "SELECT * FROM activation_records ORDER BY id DESC LIMIT 1"
         )
 
+    def cohort_has_taken_fills(self) -> bool:
+        """Durable post-fill signal: any fill, or any still-open position.
+
+        Both live in SQLite, so a restart does not forget that the cohort has
+        traded. A flat book after an exit still counts (the fill row remains).
+        """
+        fills = self.db.query_one("SELECT COUNT(*) AS c FROM fills")
+        if fills is None:
+            raise DatabaseError("fill_count_missing")
+        if int(fills["c"]) > 0:
+            return True
+        pos = self.db.query_one(
+            "SELECT COUNT(*) AS c FROM positions WHERE shares > 0"
+        )
+        if pos is None:
+            raise DatabaseError("open_position_count_missing")
+        return int(pos["c"]) > 0
+
     def counts(self) -> dict[str, int]:
         def n(table: str) -> int:
             row = self.db.query_one(f"SELECT COUNT(*) AS c FROM {table}")

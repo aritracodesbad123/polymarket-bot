@@ -102,6 +102,12 @@ class Settings(BaseModel):
     holding_thesis_edge: float = 0.02
     holding_max_hours: float = 48.0
     estimated_usd_per_ai_call: float = 0.02
+    # Hard no-fill session cap. Cost = day-scoped call count * estimated_usd_per_ai_call.
+    # <=0 disables the cap. Not the DEFEND band (that is api_die_cushion_usd).
+    ai_session_budget_usd: float = 10.0
+    # DEFEND band only: equity under start by this much, unrealized worse than
+    # -this, or burn past half of (profit + this). <=0 turns the band off.
+    # It is not the session spend cap.
     api_die_cushion_usd: float = 0.50
     defend_edge_tighten: float = 0.02
     defend_kelly_mult: float = 0.5
@@ -187,6 +193,7 @@ class Settings(BaseModel):
             holding_thesis_edge=_f("HOLDING_THESIS_EDGE", 0.02),
             holding_max_hours=_f("HOLDING_MAX_HOURS", 48.0),
             estimated_usd_per_ai_call=_f("ESTIMATED_USD_PER_AI_CALL", 0.02),
+            ai_session_budget_usd=_f("AI_SESSION_BUDGET_USD", 10.0),
             api_die_cushion_usd=_f("API_DIE_CUSHION_USD", 0.50),
             defend_edge_tighten=_f("DEFEND_EDGE_TIGHTEN", 0.02),
             defend_kelly_mult=_f("DEFEND_KELLY_MULT", 0.5),

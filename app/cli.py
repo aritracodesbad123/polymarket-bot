@@ -31,9 +31,11 @@ def cmd_status(app: TradingApp) -> int:
         print("live_blockers: " + ", ".join(auth.reasons))
     print(f"cash: {app.paper.cash:.2f} reserved: {app.paper.reserved:.2f}")
     print(f"equity: {app.paper.equity():.2f}")
+    cost = st.ai_call_count * app.settings.estimated_usd_per_ai_call
     print(
         f"ai_burn_utc_day: {st.ai_calls_utc_day or '-'} "
-        f"calls={st.ai_call_count}"
+        f"calls={st.ai_call_count} cost={cost:.4f} "
+        f"budget={app.settings.ai_session_budget_usd:.2f}"
     )
     base = "-" if st.week_baseline_equity is None else f"{st.week_baseline_equity:.2f}"
     print(f"week_started_on: {st.week_started_on or '-'} baseline={base}")
