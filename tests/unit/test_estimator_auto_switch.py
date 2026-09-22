@@ -365,3 +365,45 @@ async def test_cycle_burn_exhausted_stays_micro(tmp_path, caplog):
     assert "reason=burn_exhausted" in caplog.text
     preds = app.repo.db.query("SELECT model FROM ai_predictions")
     assert preds and preds[0]["model"] == "micro"
+
+
+@pytest.mark.asyncio
+async def test_mid_cycle_stops_llm_when_burn_catches_realized(tmp_path):
+    s = settings(
+        tmp_path,
+        api_die_cushion_usd=0.0,
+        ai_session_budget_usd=10.0,
+        estimated_usd_per_ai_call=1.0,
+        paper_starting_bankroll=50.0,
+        estimator="microstructure",
+        estimator_auto_switch=True,
+        max_grok_calls_per_cycle=8,
+    )
+    app = TradingApp(s)
+    eng = _Engine()
+    app.engine = eng
+    app.research = _Research()
+    app.repo.insert_fill({"token_id": "yes1", "side": "BUY", "shares": 2, "price": 0.4})
+    app.regime.note_ai_call(3)  # burn 3
+    app.risk.note_realized_pnl(4.0)  # covers until one more LLM call
+
+    yes = book(token_id="yes1", bid=0.38, ask=0.40, bid_size=8_000.0, ask_size=2_000.0)
+    no = book(token_id="no1", bid=0.60, ask=0.62, bid_size=2_000.0, ask_size=8_000.0)
+    markets = [market(market_id=f"m{i}", yes_token_id=f"y{i}", no_token_id=f"n{i}") for i in range(5)]
+
+    async def review(_marks):
+        return None
+
+    async def scan():
+        return [(m, None) for m in markets]
+
+    async def books(_m):
+        return yes, no
+
+    app._review_holdings = review  # type: ignore[method-assign]
+    app.scanner.scan = scan  # type: ignore[method-assign]
+    app._books = books  # type: ignore[method-assign]
+    await app.cycle()
+    # Start burn 3, realized 4 → one LLM call makes burn 4 == realized → stop.
+    assert eng.calls == 1
+    assert app.regime.session_ai_calls == 4

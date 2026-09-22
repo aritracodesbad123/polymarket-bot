@@ -37,6 +37,7 @@ from app.risk.manager import RiskManager, exposure_from_positions
 from app.risk.regime import (
     RegimeEngine,
     RegimeState,
+    estimator_auto_switch_armed,
     estimator_switch_reason,
     new_screening_allowed,
     screening_path,
@@ -370,6 +371,16 @@ class TradingApp:
                 and burn >= budget
             ):
                 break
+            # Auto-switch: stop new LLM estimates mid-cycle once burn is
+            # exhausted or no longer covered by daily realized.
+            if (
+                last is not None
+                and last.has_taken_fills
+                and estimator_auto_switch_armed(self.settings)
+            ):
+                realized = self.risk.daily_realized_pnl
+                if (budget > 0 and burn >= budget) or realized <= burn:
+                    break
             gemini_ready = bool(self.engine and self.engine.gemini)
             grok_dead = bool(
                 getattr(self.research, "blocked", False)
