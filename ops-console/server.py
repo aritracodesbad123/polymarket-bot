@@ -63,9 +63,12 @@ def parse_ts(s: str | None) -> datetime | None:
 @contextmanager
 def connect() -> sqlite3.Connection:
     """Always close — plain `with sqlite3.connect` leaks FDs on this Mac."""
-    con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2)
+    # Read-only + busy timeout so bot writers can't kill /api/snapshot mid-poll.
+    con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=30)
     con.row_factory = sqlite3.Row
     try:
+        con.execute("PRAGMA query_only=ON")
+        con.execute("PRAGMA busy_timeout=30000")
         yield con
     finally:
         con.close()
@@ -374,6 +377,115 @@ def _enrich_event(e) -> dict:
         "question": question,
         "display": display,
     }
+
+
+
+def build_trade_rounds(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per market ticket: Side · Entry · Exit · P&L (open=unrealized, closed=realized)."""
+    by: dict[str, list[dict[str, Any]]] = {}
+    for f in fills:
+        tid = str(f.get("token_id") or "") or f"fill-{f.get('fill_id')}"
+        by.setdefault(tid, []).append(f)
+    rounds: list[dict[str, Any]] = []
+    for tid, rows in by.items():
+        rows = sorted(
+            rows,
+            key=lambda r: (str(r.get("ts") or ""), int(r.get("fill_id") or 0)),
+        )
+        buy_sh = buy_cost = 0.0
+        sell_sh = sell_proceeds = 0.0
+        entry_ts = exit_ts = None
+        instrument = question = category = mode = None
+        mark = None
+        for r in rows:
+            instrument = r.get("instrument") or instrument
+            question = r.get("question") or question
+            category = r.get("category") or category
+            mode = r.get("mode") or mode
+            if r.get("mark") is not None:
+                mark = r.get("mark")
+            sh = float(r.get("shares") or 0)
+            px = float(r.get("entry_price") or 0)
+            side = (r.get("side") or "BUY").upper()
+            if side == "BUY":
+                if entry_ts is None:
+                    entry_ts = r.get("ts")
+                buy_sh += sh
+                buy_cost += sh * px
+            else:
+                exit_ts = r.get("ts")
+                sell_sh += sh
+                sell_proceeds += sh * px
+        entry_px = (buy_cost / buy_sh) if buy_sh > 1e-12 else None
+        exit_px = (sell_proceeds / sell_sh) if sell_sh > 1e-12 else None
+        net = buy_sh - sell_sh
+        matched = min(buy_sh, sell_sh)
+        closed = abs(net) <= 1e-6 and matched > 1e-12
+        if closed:
+            pnl = None
+            if entry_px is not None and exit_px is not None:
+                pnl = round((exit_px - entry_px) * matched, 4)
+            rounds.append(
+                {
+                    "token_id": tid,
+                    "instrument": instrument or "—",
+                    "question": (question or "")[:90],
+                    "category": category or "",
+                    "side": "BUY" if buy_sh >= sell_sh else "SELL",
+                    "entry_price": None if entry_px is None else round(entry_px, 4),
+                    "exit_price": None if exit_px is None else round(exit_px, 4),
+                    "entry_ts": entry_ts,
+                    "exit_ts": exit_ts,
+                    "shares": round(matched, 4),
+                    "size_usd": round(matched * (entry_px or 0), 4),
+                    "pnl": pnl,
+                    "pnl_kind": "realized",
+                    "live": False,
+                    "status": "CLOSED",
+                    "mode": mode or "PAPER",
+                    "fill_ids": [r.get("fill_id") for r in rows],
+                }
+            )
+        else:
+            # Open residual — P&L is unrealized on remaining shares
+            open_sh = abs(net)
+            side = "BUY" if net > 0 else "SELL"
+            entry_for_open = entry_px if side == "BUY" else exit_px
+            # Prefer live mark from enriched fill
+            for r in reversed(rows):
+                if r.get("mark") is not None:
+                    mark = r.get("mark")
+                    break
+            unreal = None
+            if mark is not None and entry_for_open is not None and open_sh > 0:
+                if side == "BUY":
+                    unreal = (float(mark) - entry_for_open) * open_sh
+                else:
+                    unreal = (entry_for_open - float(mark)) * open_sh
+            rounds.append(
+                {
+                    "token_id": tid,
+                    "instrument": instrument or "—",
+                    "question": (question or "")[:90],
+                    "category": category or "",
+                    "side": side,
+                    "entry_price": None if entry_for_open is None else round(entry_for_open, 4),
+                    "exit_price": None,
+                    "entry_ts": entry_ts if side == "BUY" else exit_ts,
+                    "exit_ts": None,
+                    "shares": round(open_sh, 4),
+                    "size_usd": round(open_sh * (entry_for_open or 0), 4),
+                    "pnl": None if unreal is None else round(unreal, 4),
+                    "pnl_kind": "unrealized",
+                    "live": True,
+                    "status": "OPEN",
+                    "mode": mode or "PAPER",
+                    "mark": mark,
+                    "fill_ids": [r.get("fill_id") for r in rows],
+                }
+            )
+    rounds.sort(key=lambda r: str(r.get("entry_ts") or ""), reverse=True)
+    return rounds
 
 
 def _enrich_fill(r, trading_mode: str = "paper") -> dict:
@@ -983,6 +1095,12 @@ def build_snapshot() -> dict[str, Any]:
         t["mtm_live"] = True
         t["mtm_ts"] = mtm_ts
 
+    # One row per ticket for the dashboard (not one row per fill).
+    executed = build_trade_rounds(executed)
+    trades_n = len(executed)
+    open_trades_n = sum(1 for r in executed if r.get("live"))
+    closed_trades_n = trades_n - open_trades_n
+
     payload.update(
         {
             "mode": (state["trading_mode"] if state else "unknown").upper()
@@ -1007,7 +1125,10 @@ def build_snapshot() -> dict[str, Any]:
             "daily_loss_used": round(max(0.0, -daily_pnl), 4),
             "daily_loss_budget": DAILY_LOSS_BUDGET,
             "fills": fills_n,
-            "first_fill": fills_n > 0,
+            "trades": trades_n,
+            "open_trades": open_trades_n,
+            "closed_trades": closed_trades_n,
+            "first_fill": trades_n > 0,
             "executed_trades": executed,
             "open_positions": int(open_pos["n"] or 0),
             "open_notional": float(
@@ -1222,7 +1343,9 @@ function drawEquityChart(d){
 async function tick(){
   try{
     const r = await fetch('/api/snapshot?'+Date.now());
+    if(!r.ok){ $('sub').textContent = 'poll HTTP '+r.status; return; }
     const d = await r.json();
+    if(d.error){ $('sub').textContent = 'DB: '+d.error; }
     render(d);
   }catch(e){
     $('sub').textContent = 'poll failed: '+e;
@@ -1235,7 +1358,7 @@ function render(d){
     <span class="pill"><span class="dot ${up?'on':'off'}"></span>LaunchAgent ${up?'UP':'DOWN'}${d.agent?.pid? ' · pid '+d.agent.pid:''}${d.agent?.etime? ' · '+d.agent.etime:''}</span>
     <span class="pill ${clsMode(d.mode)}">${esc(d.mode)}${d.halted? ' · '+esc(d.halt_reason||'halted'):''}</span>
     <span class="pill accent">${esc(d.provider_latest_decision||d.provider_model_log||'provider?')}</span>
-    <span class="pill">${d.first_fill?'FIRST FILL ✓':'no fills yet'}</span>
+    <span class="pill">${d.first_fill?'HAS TRADES ✓':'no trades yet'}</span>
   `;
   function bars(obj){
     const entries=Object.entries(obj||{});
@@ -1253,26 +1376,21 @@ function render(d){
   const rejRows = (d.last_5_rejects||[]).map(r=>`<tr><td>${fmtTs(r.ts)}</td><td class="accent">${esc(r.instrument||'—')}</td><td title="${esc(r.question||'')}">${esc((r.question||'—').slice(0,64))}</td><td>${esc((r.reject_reason||'').slice(0,36))}</td><td>${r.raw_edge??'—'}</td></tr>`).join('');
   const mtmClock = fmtTs(d.ts);
   const tradeRows = (d.executed_trades||[]).map(t=>{
-    const mark = t.mark!=null?Number(t.mark).toFixed(4):'—';
-    const bid = t.bid!=null?Number(t.bid).toFixed(3):null;
-    const ask = t.ask!=null?Number(t.ask).toFixed(3):null;
-    const book = (bid!=null && ask!=null) ? `<div class="meta">${bid}/${ask}</div>` : '';
-    const unreal = (!t.live || t.unrealized==null) ? '—' : ((t.unrealized>=0?'+':'')+Number(t.unrealized).toFixed(4));
-    const mtm = t.mtm_live ? fmtTs(t.mtm_ts||d.ts) : '—';
-    return `<tr data-fill="${t.fill_id??''}">
-        <td>${t.fill_id??'—'}</td>
-        <td>${fmtTs(t.ts)}</td>
+    const pnl = t.pnl==null ? '—' : ((t.pnl>=0?'+':'')+Number(t.pnl).toFixed(2));
+    const pnlCls = t.pnl==null ? '' : (t.pnl>=0?'ok':'bad');
+    const pnlLabel = t.pnl_kind==='realized' ? 'closed' : (t.live ? 'open' : '');
+    const capital = t.size_usd!=null ? ('$'+Number(t.size_usd).toFixed(2)) : '—';
+    return `<tr>
         <td class="accent">${esc(t.instrument||'—')}</td>
-        <td title="${esc(t.question||'')}">${esc((t.question||'—').slice(0,48))}</td>
+        <td title="${esc(t.question||'')}">${esc((t.question||'—').slice(0,56))}</td>
         <td>${esc(t.side||'')}</td>
-        <td>${t.entry_price!=null?Number(t.entry_price).toFixed(4):'—'}</td>
-        <td>${mark}${book}</td>
-        <td class="mtm-unreal ${(t.unrealized||0)>=0?'ok':'bad'}">${unreal}</td>
-        <td class="meta">${mtm}</td>
-        <td>$${t.size_usd!=null?Number(t.size_usd).toFixed(2):'—'}</td>
-        <td>${t.decision_id??'—'}</td>
+        <td>${t.entry_price!=null?Number(t.entry_price).toFixed(2):'—'}</td>
+        <td>${t.exit_price!=null?Number(t.exit_price).toFixed(2):'—'}</td>
+        <td>${capital}</td>
+        <td class="mtm-unreal ${pnlCls}">${pnl}${pnlLabel?`<div class="meta">${pnlLabel}</div>`:''}</td>
         <td><span class="pill ${t.live?'ok':'warn'}">${esc(t.status||'')}</span></td>
-        <td>${esc(t.mode||'PAPER')}</td>
+        <td class="meta">${fmtTs(t.entry_ts)}</td>
+        <td class="meta">${t.exit_ts?fmtTs(t.exit_ts):'—'}</td>
       </tr>`;
   }).join('');
   const liveRej = (d.recent_rejects||[]).map(r=>`<tr><td>${fmtTs(r.ts||d.ts)}</td><td class="accent">${esc(r.instrument||'—')}</td><td title="${esc(r.question||'')}">${esc((r.question||'—').slice(0,72))}</td><td>${esc((r.reject_reason||'').slice(0,40))}</td></tr>`).join('');
@@ -1291,8 +1409,8 @@ function render(d){
     <div class="card"><h2>AI budget</h2><div class="big ${(d.ai_budget?.regime_mode==='ATTACK')?'ok':(d.ai_budget?.regime_mode==='DEFEND'?'warn':'bad')}">${esc(d.ai_budget?.regime_mode||'—')} · $${Number(d.ai_budget?.estimated_burn_usd||0).toFixed(2)} / $${Number(d.ai_budget?.session_budget_usd||10).toFixed(0)}</div>
       <div class="meta">est. · ${d.ai_budget?.ai_calls||0} calls · left $${Number(d.ai_budget?.budget_remaining_usd||0).toFixed(2)} · ${esc(d.ai_budget?.regime_reason||'')}</div>
       <div class="meta">as of ${fmtTs(d.ai_budget?.as_of||d.ts)}</div></div>
-    <div class="card"><h2>Fills + PnL</h2><div class="big">${d.fills} fills</div>
-      <div class="meta">open pos ${d.open_positions} · notional $${Number(d.open_notional).toFixed(2)} · approved 2h ${d.approved_2h}</div>
+    <div class="card"><h2>Trades + PnL</h2><div class="big">${d.trades??d.executed_trades?.length??0} trades</div>
+      <div class="meta">open ${d.open_trades??0} · closed ${d.closed_trades??0} · notional $${Number(d.open_notional).toFixed(2)} · approved 2h ${d.approved_2h}</div>
       <div class="meta">as of ${asOf(d)}</div></div>
     <div class="card"><h2>Paper lock</h2><div class="big">${fmtDur(d.paper_lock_remaining_s)}</div>
       <div class="meta">started ${fmtTs(d.paper_started_at)} · as of ${asOf(d)}</div></div>
@@ -1308,7 +1426,7 @@ function render(d){
         <div><strong>${f.estimates_ok||0}</strong><span>est OK</span></div>
         <div><strong>${f.edge_pass||0}</strong><span>edge pass</span></div>
         <div><strong>${f.size_pass||0}</strong><span>size pass</span></div>
-        <div><strong>${f.fills||0}</strong><span>fills</span></div>
+        <div><strong>${d.trades??f.fills||0}</strong><span>trades</span></div>
       </div>
       <div class="meta" style="margin-top:8px">avg fee-edge rejects ${d.avg_fee_edge_rejects??'—'} · approvals ${d.avg_fee_edge_approvals??'—'}</div>
     </div>
@@ -1329,12 +1447,14 @@ function render(d){
     <div class="card"><h2>Rejected spread width (2h)</h2><div class="meta">as of ${asOf(d)}</div><div class="barwrap">${spreadHtml}</div>
       <div class="meta">buckets from gates.spread_width / TRADE_REJECTED · n=${d.spread_bucket_total||0}</div></div>
     <div class="card wide"><h2>Reject mix (2h)</h2><div class="meta">as of ${asOf(d)}</div><div class="barwrap">${mixHtml}</div></div>
-    <div class="card full"><h2>Executed trades · MTM ${d.marks_live?.ok?'LIVE':'DB'} · as of ${mtmClock}</h2>
+    <div class="card full"><h2>Trades · as of ${mtmClock}</h2>
+      <div class="meta">One row per ticket — open P&amp;L while live, closed P&amp;L when exited</div>
       <table><thead><tr>
-        <th>#</th><th>entry date · time</th><th>inst</th><th>question</th><th>side</th>
-        <th>entry</th><th>mark</th><th>unreal</th><th>mtm</th><th>size</th><th>dec</th><th>status</th><th>mode</th>
+        <th>market</th><th>question</th><th>side</th>
+        <th>entry</th><th>exit</th><th>traded capital</th><th>P&amp;L ($)</th><th>status</th>
+        <th>opened</th><th>closed</th>
       </tr></thead>
-      <tbody>${tradeRows||'<tr><td colspan=13 class="meta">no fills yet</td></tr>'}</tbody></table>
+      <tbody>${tradeRows||'<tr><td colspan=10 class="meta">no trades yet</td></tr>'}</tbody></table>
     </div>
     <div class="card wide"><h2>Last rejects — instrument · question · reason</h2><div class="meta">as of ${asOf(d)}</div>
       <table><thead><tr><th>date · time</th><th>inst</th><th>question</th><th>reason</th><th>raw</th></tr></thead><tbody>${rejRows||'<tr><td colspan=5>—</td></tr>'}</tbody></table>
