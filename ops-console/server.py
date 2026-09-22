@@ -116,7 +116,7 @@ def live_marks_by_token(con: sqlite3.Connection) -> dict[str, Any]:
                 _MARKS_CACHE.update({"t": time.time(), "by_token": {}, "ok": False, "err": "no positions"})
                 return dict(_MARKS_CACHE)
         rows = con.execute(
-            "SELECT token_id, market_id, shares, avg_price FROM positions WHERE shares != 0"
+            "SELECT token_id, market_id, shares, avg_price FROM positions WHERE shares > 0"
         ).fetchall()
         by_token: dict[str, dict[str, Any]] = {}
         err: str | None = None
@@ -605,7 +605,7 @@ def build_snapshot() -> dict[str, Any]:
         ).fetchall()
 
         open_pos = con.execute(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(ABS(shares*avg_price)),0) AS notional FROM positions WHERE shares != 0"
+            "SELECT COUNT(*) AS n, COALESCE(SUM(ABS(shares*avg_price)),0) AS notional FROM positions WHERE shares > 0"
             if _has_positions_cols(con)
             else "SELECT 0 AS n, 0 AS notional"
         ).fetchone()

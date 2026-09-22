@@ -24,6 +24,8 @@ def exposure_from_positions(positions: list, marks: dict[str, float]) -> Exposur
     for p in positions:
         token = p["token_id"] if not isinstance(p, dict) else p["token_id"]
         shares = float(p["shares"])
+        if shares <= 1e-12:
+            continue
         avg = float(p["avg_price"])
         mark = marks.get(token, avg)
         usd = shares * mark

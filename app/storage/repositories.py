@@ -430,6 +430,33 @@ class Repositories:
     def positions(self) -> list:
         return self.db.query("SELECT * FROM positions WHERE shares > 0")
 
+    def delete_positions_except(self, token_ids: list[str]) -> None:
+        """Remove position rows that are not in the open book."""
+        if not token_ids:
+            self.db.execute("DELETE FROM positions")
+            return
+        marks = ",".join("?" for _ in token_ids)
+        self.db.execute(
+            f"DELETE FROM positions WHERE token_id NOT IN ({marks})",
+            tuple(token_ids),
+        )
+
+    def persist_open_book(self, snap: dict[str, Any], positions: list[dict[str, Any]]) -> None:
+        """Persist cash/equity and the open book in one commit.
+
+        A full SELL updates cash in the same snapshot that drops the position.
+        Leaving the row would mark those shares again on top of sale proceeds.
+        """
+        with self.db.transaction():
+            self.insert_portfolio(snap)
+            keep: list[str] = []
+            for row in positions:
+                if float(row["shares"]) <= 1e-12:
+                    continue
+                self.upsert_position(row)
+                keep.append(str(row["token_id"]))
+            self.delete_positions_except(keep)
+
     def insert_portfolio(self, row: dict[str, Any]) -> None:
         self.db.execute(
             """INSERT INTO portfolio_snapshots (

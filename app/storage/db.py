@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -21,11 +22,31 @@ class Database:
             init_db(self.cx)
         except sqlite3.Error as exc:
             raise DatabaseError(str(exc)) from exc
+        self._tx_depth = 0
+
+    @contextmanager
+    def transaction(self):
+        """Commit several writes together. A failure rolls the whole batch back."""
+        self._tx_depth += 1
+        try:
+            yield
+            if self._tx_depth == 1:
+                self.cx.commit()
+        except Exception:
+            if self._tx_depth == 1:
+                try:
+                    self.cx.rollback()
+                except sqlite3.Error:
+                    pass
+            raise
+        finally:
+            self._tx_depth -= 1
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         try:
             cur = self.cx.execute(sql, params)
-            self.cx.commit()
+            if self._tx_depth == 0:
+                self.cx.commit()
             return cur
         except sqlite3.Error as exc:
             raise DatabaseError(str(exc)) from exc
@@ -33,7 +54,8 @@ class Database:
     def executemany(self, sql: str, seq: list[tuple]) -> None:
         try:
             self.cx.executemany(sql, seq)
-            self.cx.commit()
+            if self._tx_depth == 0:
+                self.cx.commit()
         except sqlite3.Error as exc:
             raise DatabaseError(str(exc)) from exc
 

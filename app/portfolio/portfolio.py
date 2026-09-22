@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.broker.paper import PaperBroker, PaperPosition
+from app.broker.paper import FLAT_SHARES, PaperBroker, PaperPosition
 from app.storage.repositories import Repositories
 
 
@@ -11,10 +11,27 @@ class Portfolio:
 
     def snapshot(self, marks: dict[str, float] | None = None) -> dict:
         marks = marks or {}
+        for tid, p in list(self.paper._positions.items()):
+            if p.shares <= FLAT_SHARES:
+                del self.paper._positions[tid]
         unreal = 0.0
+        open_rows: list[dict] = []
         for p in self.paper._positions.values():
+            if p.shares <= FLAT_SHARES:
+                continue
             m = marks.get(p.token_id, p.avg_price)
             unreal += p.shares * (m - p.avg_price)
+            open_rows.append(
+                {
+                    "token_id": p.token_id,
+                    "market_id": p.market_id,
+                    "shares": p.shares,
+                    "avg_price": p.avg_price,
+                    "realized_pnl": p.realized_pnl,
+                    "category": p.category,
+                    "correlation_group": p.correlation_group,
+                }
+            )
         snap = {
             "cash": self.paper.cash,
             "reserved_cash": self.paper.reserved,
@@ -23,20 +40,7 @@ class Portfolio:
             "realized_pnl": self.paper.realized_pnl,
             "unrealized_pnl": unreal,
         }
-        self.repo.insert_portfolio(snap)
-        for p in self.paper._positions.values():
-            if p.shares > 0:
-                self.repo.upsert_position(
-                    {
-                        "token_id": p.token_id,
-                        "market_id": p.market_id,
-                        "shares": p.shares,
-                        "avg_price": p.avg_price,
-                        "realized_pnl": p.realized_pnl,
-                        "category": p.category,
-                        "correlation_group": p.correlation_group,
-                    }
-                )
+        self.repo.persist_open_book(snap, open_rows)
         return snap
 
     def hydrate_paper(self, starting_bankroll: float) -> None:
@@ -56,11 +60,14 @@ class Portfolio:
         self.paper.realized_pnl = float(snap["realized_pnl"] or 0.0)
         self.paper._positions.clear()
         for row in self.repo.positions():
+            shares = float(row["shares"] or 0.0)
+            if shares <= FLAT_SHARES:
+                continue
             token = row["token_id"]
             self.paper._positions[token] = PaperPosition(
                 token_id=token,
                 market_id=row["market_id"] or "",
-                shares=float(row["shares"]),
+                shares=shares,
                 avg_price=float(row["avg_price"]),
                 realized_pnl=float(row["realized_pnl"] or 0.0),
                 category=row["category"] or "",
