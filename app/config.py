@@ -109,6 +109,9 @@ class Settings(BaseModel):
     # Hard no-fill session cap. Cost = day-scoped call count * estimated_usd_per_ai_call.
     # <=0 disables the cap. Not the DEFEND band (that is api_die_cushion_usd).
     ai_session_budget_usd: float = 10.0
+    # ``microstructure`` arms the non-LLM book estimator after the session
+    # budget stops screening. Unset (or any other value) keeps the burn-stop.
+    estimator: str | None = None
     # DEFEND band only: equity under start by this much, unrealized worse than
     # -this, or burn past half of (profit + this). <=0 turns the band off.
     # It is not the session spend cap.
@@ -200,6 +203,7 @@ class Settings(BaseModel):
             holding_max_hours=_f("HOLDING_MAX_HOURS", 48.0),
             estimated_usd_per_ai_call=_f("ESTIMATED_USD_PER_AI_CALL", 0.02),
             ai_session_budget_usd=_f("AI_SESSION_BUDGET_USD", 10.0),
+            estimator=_s("ESTIMATOR", "").lower() or None,
             api_die_cushion_usd=_f("API_DIE_CUSHION_USD", 0.50),
             defend_edge_tighten=_f("DEFEND_EDGE_TIGHTEN", 0.02),
             defend_kelly_mult=_f("DEFEND_KELLY_MULT", 0.5),

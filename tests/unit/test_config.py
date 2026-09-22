@@ -25,6 +25,7 @@ def test_defaults():
     assert s.kill_floor_pct == 0.20
     assert s.min_tradeable_mid == 0.10
     assert s.max_tradeable_mid == 0.90
+    assert s.estimator is None
     assert s.weekly_loss_pct is None
     assert s.max_position_usd is None
     assert s.max_total_exposure_usd is None
@@ -49,6 +50,24 @@ def test_tradeable_mid_from_env(monkeypatch, tmp_path):
     overridden = Settings.from_env(dotenv_path=tmp_path / "none.env")
     assert overridden.min_tradeable_mid == 0.15
     assert overridden.max_tradeable_mid == 0.85
+
+
+def test_estimator_from_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("ESTIMATOR", raising=False)
+    blank = Settings.from_env(dotenv_path=tmp_path / "none.env")
+    assert blank.estimator is None
+
+    monkeypatch.setenv("ESTIMATOR", "")
+    empty = Settings.from_env(dotenv_path=tmp_path / "none.env")
+    assert empty.estimator is None
+
+    monkeypatch.setenv("ESTIMATOR", "microstructure")
+    armed = Settings.from_env(dotenv_path=tmp_path / "none.env")
+    assert armed.estimator == "microstructure"
+
+    monkeypatch.setenv("ESTIMATOR", "OFF")
+    off = Settings.from_env(dotenv_path=tmp_path / "none.env")
+    assert off.estimator == "off"
 
 
 def test_gemini_key_stripped(monkeypatch, tmp_path):
