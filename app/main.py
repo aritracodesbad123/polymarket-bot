@@ -172,6 +172,10 @@ class TradingApp:
             if p.last_mark is not None
         }
         self.risk = RiskManager(settings, self.repo)
+        # Any returned book, Gamma market, or scan list clears the fault streak.
+        # A 404 does not. The callback covers executor fetches; the loop also
+        # marks success when a test stub stands in for the client.
+        self.data.on_success = self.risk.note_api_ok
         self.regime = RegimeEngine(settings, self.repo)
         self.strategy = StrategyEvaluator(settings)
         self.micro = MicrostructureEstimator(
@@ -435,10 +439,12 @@ class TradingApp:
 
     async def _books(self, m):
         yes_book = await self.data.get_order_book(m.yes_token_id, m.market_id)
+        self.risk.note_api_ok()
         no_book = None
         if m.no_token_id:
             try:
                 no_book = await self.data.get_order_book(m.no_token_id, m.market_id)
+                self.risk.note_api_ok()
             except Exception as exc:
                 # A missing NO book is not a sick API. The YES book still screens.
                 # A timeout or 5xx on the NO book is a real fault and must surface.
@@ -604,6 +610,8 @@ class TradingApp:
                 continue
             try:
                 book = await self.data.get_order_book(pos.token_id, pos.market_id)
+                # Empty book is still a successful read. 404 never gets here.
+                self.risk.note_api_ok()
             except Exception as exc:
                 if is_not_found(exc):
                     # Market removed its book. Settle if Gamma has an outcome;
@@ -730,6 +738,8 @@ class TradingApp:
             if is_api_fault(exc):
                 self.risk.note_api_failure()
             return False
+        if market is not None:
+            self.risk.note_api_ok()
         if market is None:
             return False
         px = resolution_price(market, pos.token_id)

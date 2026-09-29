@@ -12,7 +12,7 @@ A separate live book read (SDK, no deadline) could sit forever, so the cycle nev
 
 ## What a halt does
 
-`note_api_failure` counts in memory. One successful Gamma scan calls `note_api_ok` and zeros that counter. That reset is not "N healthy cycles." It does **not** clear a halt that has already been written.
+`note_api_failure` counts in memory. Any successful API call zeros that counter: a Gamma scan, a Gamma market read that returns a market, or an order book (including an empty book). A 404 does not count as a fault and does not count as a success. The reset is not "N healthy cycles." It does **not** clear a halt that has already been written.
 
 Once `halted=1`, the flag stays until an operator clears it. The counter is irrelevant after that: the next cycle does not scan, does not trade, and does not auto-resume. Survival, kill-floor, weekly equity, daily realized loss, drawdown, and operator `kill` use the same latch. This build does not auto-clear any of them.
 
@@ -38,7 +38,7 @@ HALTED reason=<halt_reason> since=<system_state.updated_at>
 |---|---|---|
 | CLOB 404 / not found | not counted | Gamma settlement if the outcome is pinned (`HOLDING_SETTLE`). If Gamma has no pinned resolution (closed but unresolved, or no market row), the ticket stays open, `book_gone`, last mark kept, `HOLDING_BOOK_GONE` once per position per cycle. Next cycle tries settlement again. |
 | Screening 404 on the YES book | not counted | Candidate skipped. |
-| 5xx, 429, timeout, network | counted | Ticket unchanged. Eight faults still halt with `repeated_api_failures`. |
+| 5xx, 429, timeout, network | counted | Ticket unchanged. Eight faults still halt with `repeated_api_failures`. A later successful book, Gamma market, or scan zeros the streak. |
 | Gamma 404 (no such market id) | not counted | `get_market` returns nothing. The book path still runs. |
 
 Order-book and Gamma calls use a 20s deadline. A timeout is a fault. It does not freeze the loop.

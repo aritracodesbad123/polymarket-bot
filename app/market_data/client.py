@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -292,6 +293,13 @@ class PolymarketClient:
         self.ws_url = ws_url
         self.timeout_s = timeout_s
         self._sdk = None
+        # Set by the trading loop. A returned book, market, or market list
+        # zeros the API-fault streak. 404 and timeouts do not call this.
+        self.on_success: Callable[[], None] | None = None
+
+    def _succeeded(self) -> None:
+        if self.on_success is not None:
+            self.on_success()
 
     async def _public(self):
         if self._sdk is None:
@@ -308,7 +316,9 @@ class PolymarketClient:
         """
         pool_target = max(limit * 5, 250)
         out = await self._list_markets_http(closed=closed, limit=pool_target)
-        return rank_markets_for_universe(out)[:limit]
+        ranked = rank_markets_for_universe(out)[:limit]
+        self._succeeded()
+        return ranked
 
     async def _list_markets_http(self, *, closed: bool, limit: int) -> list[Market]:
         import httpx
@@ -407,6 +417,7 @@ class PolymarketClient:
                     offset += page_size
         ranked = rank_markets_for_universe(out)
         if len(tags) <= 1 or limit < len(tags):
+            self._succeeded()
             return ranked[:limit]
         # Reserve slots per tag so liquid crypto doesn't crowd out forex/FX.
         per = max(limit // len(tags), 1)
@@ -427,6 +438,7 @@ class PolymarketClient:
             if m.market_id not in seen_ids:
                 picked.append(m)
                 seen_ids.add(m.market_id)
+        self._succeeded()
         return picked[:limit]
 
     async def get_market(self, market_id: str) -> Market | None:
@@ -438,9 +450,12 @@ class PolymarketClient:
         if not market_id:
             return None
         try:
-            return await asyncio.wait_for(self._get_market(market_id), timeout=self.timeout_s)
+            market = await asyncio.wait_for(self._get_market(market_id), timeout=self.timeout_s)
         except TimeoutError:
             raise
+        if market is not None:
+            self._succeeded()
+        return market
 
     async def _get_market(self, market_id: str) -> Market | None:
         import httpx
@@ -479,7 +494,7 @@ class PolymarketClient:
                 raise BookNotFound(token_id) from exc
             if is_timeout(exc):
                 raise
-            return await self._book_http(token_id, market_id)
+            return await self._book_ok(token_id, market_id)
         try:
             book = await asyncio.wait_for(
                 client.get_order_book(token_id), timeout=self.timeout_s
@@ -491,8 +506,14 @@ class PolymarketClient:
                 raise BookNotFound(token_id) from exc
             if is_timeout(exc):
                 raise
-            return await self._book_http(token_id, market_id)
+            return await self._book_ok(token_id, market_id)
+        self._succeeded()
         return self._sdk_book(book, token_id, market_id)
+
+    async def _book_ok(self, token_id: str, market_id: str) -> OrderBook:
+        book = await self._book_http(token_id, market_id)
+        self._succeeded()
+        return book
 
     def _sdk_book(self, book: Any, token_id: str, market_id: str) -> OrderBook:
         tick = float(_get(book, "tick_size", "tickSize", default=0.01) or 0.01)

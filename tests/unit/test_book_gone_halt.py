@@ -245,10 +245,20 @@ async def test_hung_gamma_times_out_and_counts(tmp_path):
 
     app.data._get_market = hang  # type: ignore[method-assign]
     app.data.get_order_book = book  # type: ignore[method-assign]
+    counted = {"n": 0}
+    orig = app.risk.note_api_failure
+
+    def note():
+        counted["n"] += 1
+        orig()
+
+    app.risk.note_api_failure = note  # type: ignore[method-assign]
     started = time.monotonic()
     await app._review_holdings({})
     assert time.monotonic() - started < 2.0
-    assert app.risk._api_failures == 1
+    # The timeout counted, then the live book cleared the streak.
+    assert counted["n"] == 1
+    assert app.risk._api_failures == 0
     assert "tok" in app.paper._positions
     assert not app.paper._positions["tok"].book_gone
 
@@ -443,3 +453,89 @@ async def test_rest_404_is_book_not_found_and_hung_sdk_times_out(monkeypatch):
     with pytest.raises(TimeoutError):
         await client.get_order_book("tok", "m1")
     assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.asyncio
+async def test_one_cycle_settles_thirteen_resolved_positions(tmp_path):
+    """Prod shape: 13 held tokens, Gamma resolved, CLOB 404 or empty. One cycle.
+
+    The loss-streak cap is raised only in this fixture. Thirteen redemptions
+    must not be what the test is measuring. The API counter starts at 7 so a
+    counted 404 would halt, and a success has to clear that streak.
+    """
+    app = TradingApp(
+        settings(
+            tmp_path,
+            paper_latency_ms=0,
+            paper_starting_bankroll=5000.0,
+            holding_stop_pct=0.25,
+            max_consecutive_losses=20,
+        )
+    )
+    resolved = {}
+    for i in range(13):
+        token_id = f"tok{i}"
+        market_id = f"m{i}"
+        _plant(app, token_id=token_id, market_id=market_id)
+        resolved[market_id] = market(
+            market_id=market_id,
+            yes_token_id=token_id,
+            no_token_id=f"no-{token_id}",
+            closed=True,
+            active=False,
+            status="closed",
+            yes_price=0.0,
+            no_price=1.0,
+        )
+
+    async def book(token_id: str, _market_id: str = ""):
+        if int(token_id.removeprefix("tok")) % 2 == 0:
+            raise BookNotFound(token_id)
+        return OrderBook(token_id=token_id, market_id=_market_id)
+
+    async def get_market(market_id: str):
+        return resolved[market_id]
+
+    async def scan():
+        return []
+
+    app.data.get_order_book = book  # type: ignore[method-assign]
+    app.data.get_market = get_market  # type: ignore[method-assign]
+    app.scanner.scan = scan  # type: ignore[method-assign]
+    app.risk._api_failures = 7
+
+    await app.cycle()
+
+    assert app.paper._positions == {}
+    assert app.repo.positions() == []
+    assert len(_events(app, "HOLDING_SETTLE")) == 13
+    assert _events(app, "HOLDING_BOOK_GONE") == []
+    assert not app.repo.state().halted
+    assert app.risk._api_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_empty_book_resets_api_failures_without_a_scan(tmp_path):
+    app = _app(tmp_path)
+    _plant(app)
+    app.data.get_market = _no_market  # type: ignore[method-assign]
+
+    async def book(_token_id: str, _market_id: str = ""):
+        return OrderBook(token_id="tok", market_id="4761828")
+
+    app.data.get_order_book = book  # type: ignore[method-assign]
+    app.risk._api_failures = 7
+    await app._review_holdings({})
+    assert app.risk._api_failures == 0
+    assert not app.repo.state().halted
+    assert "tok" in app.paper._positions
+
+    async def gone(_token_id: str, _market_id: str = ""):
+        raise BookNotFound("tok")
+
+    app.data.get_order_book = gone  # type: ignore[method-assign]
+    app.risk._api_failures = 7
+    await app._review_holdings({})
+    assert app.risk._api_failures == 7
+    assert not app.repo.state().halted
+    assert app.paper._positions["tok"].book_gone
