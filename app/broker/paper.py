@@ -21,6 +21,10 @@ class PaperPosition:
     realized_pnl: float = 0.0
     category: str = ""
     correlation_group: str = ""
+    # Set when the CLOB book 404s and Gamma has not pinned a settlement price.
+    book_gone: bool = False
+    # Last live mark. A missing book must not replace this with a made-up price.
+    last_mark: float | None = None
 
 
 @dataclass
@@ -35,6 +39,15 @@ class Resting:
 
 # Long inventory at or under this size is flat: drop it, do not mark it.
 FLAT_SHARES = 1e-12
+
+
+def _mark_px(pos: PaperPosition, marks: dict[str, float]) -> float:
+    """Live mark, else the last one we stored, else cost."""
+    if pos.token_id in marks:
+        return float(marks[pos.token_id])
+    if pos.last_mark is not None:
+        return float(pos.last_mark)
+    return float(pos.avg_price)
 
 
 class PaperBroker:
@@ -60,7 +73,7 @@ class PaperBroker:
         for p in self._positions.values():
             if p.shares <= FLAT_SHARES:
                 continue
-            px = marks.get(p.token_id, p.avg_price)
+            px = _mark_px(p, marks)
             inv += p.shares * px
         return self.cash + self.reserved + inv
 
@@ -80,7 +93,7 @@ class PaperBroker:
         for p in self._positions.values():
             if p.shares <= FLAT_SHARES:
                 continue
-            px = marks.get(p.token_id, p.avg_price)
+            px = _mark_px(p, marks)
             tot += p.shares * px
         return tot + self.reserved
 

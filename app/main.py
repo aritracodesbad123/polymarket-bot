@@ -22,7 +22,7 @@ from app.broker.paper import PaperBroker
 from app.config import Settings
 from app.evaluation.reports import daily_report
 from app.execution.executor import Executor, exit_attempt_key, idempotency_key
-from app.market_data.client import PolymarketClient
+from app.market_data.client import PolymarketClient, is_api_fault, is_not_found
 from app.market_data.scanner import (
     MID_OUTSIDE_BAND,
     MarketScanner,
@@ -166,6 +166,11 @@ class TradingApp:
         self.executor = Executor(settings, self.repo, self.paper, self.live, self.data)
         self.portfolio = Portfolio(self.paper, self.repo)
         self.portfolio.hydrate_paper(settings.paper_starting_bankroll)
+        self._last_marks = {
+            tid: float(p.last_mark)
+            for tid, p in self.paper._positions.items()
+            if p.last_mark is not None
+        }
         self.risk = RiskManager(settings, self.repo)
         self.regime = RegimeEngine(settings, self.repo)
         self.strategy = StrategyEvaluator(settings)
@@ -244,6 +249,9 @@ class TradingApp:
         self.risk.enforce_daily_realized_cap()
         st = self.repo.state()
         if st.halted:
+            # The halt flag latches until `resume-paper`. Stay silent and the
+            # process looks dead. Log every cycle; do not clear the halt.
+            self._log_halt_heartbeat(st)
             return
         # Exits stay on this path. Session-budget DIE and the post-fill
         # screening stop skip new AI calls. ESTIMATOR=microstructure keeps
@@ -256,7 +264,12 @@ class TradingApp:
         for p in self.paper._positions.values():
             if p.shares <= 0:
                 continue
-            mpx = marks.get(p.token_id, p.avg_price)
+            if p.token_id in marks:
+                mpx = marks[p.token_id]
+            elif p.last_mark is not None:
+                mpx = p.last_mark
+            else:
+                mpx = p.avg_price
             unreal += p.shares * (mpx - p.avg_price)
         equity = self.paper.equity(marks)
         realized = self.risk.daily_realized_pnl
@@ -398,13 +411,40 @@ class TradingApp:
             if grok_dead and not gemini_ready:
                 break
 
+    def _log_halt_heartbeat(self, st) -> None:
+        since = self._halt_since()
+        reason = st.halt_reason or ""
+        msg = f"HALTED reason={reason} since={since}"
+        self.log.warning(msg)
+        self.repo.event("HALTED", msg, {"reason": reason, "since": since})
+
+    def _halt_since(self) -> str:
+        row = self.db.query_one("SELECT updated_at FROM system_state WHERE id=1")
+        if row is None or row["updated_at"] is None:
+            return "unknown"
+        return str(row["updated_at"])
+
+    def _note_book_exc(self, exc: BaseException, where: str) -> str:
+        """Classify a book fetch. 'gone' does not touch the API-failure counter."""
+        if is_not_found(exc):
+            self.log.info("BOOK_GONE %s %s", where, exc)
+            return "gone"
+        self.risk.note_api_failure()
+        self.repo.event("API_ERROR", f"{where}:{exc}")
+        return "fault"
+
     async def _books(self, m):
         yes_book = await self.data.get_order_book(m.yes_token_id, m.market_id)
-        no_book = (
-            await self.data.get_order_book(m.no_token_id, m.market_id)
-            if m.no_token_id
-            else None
-        )
+        no_book = None
+        if m.no_token_id:
+            try:
+                no_book = await self.data.get_order_book(m.no_token_id, m.market_id)
+            except Exception as exc:
+                # A missing NO book is not a sick API. The YES book still screens.
+                # A timeout or 5xx on the NO book is a real fault and must surface.
+                if not is_not_found(exc):
+                    raise
+                self.log.info("BOOK_GONE no_token market=%s %s", m.market_id, exc)
         return yes_book, no_book
 
     def _mark_books(self, m, yes_book, no_book, marks: dict[str, float]) -> None:
@@ -565,8 +605,12 @@ class TradingApp:
             try:
                 book = await self.data.get_order_book(pos.token_id, pos.market_id)
             except Exception as exc:
-                self.risk.note_api_failure()
-                self.repo.event("API_ERROR", f"holding_book:{exc}")
+                if is_not_found(exc):
+                    # Market removed its book. Settle if Gamma has an outcome;
+                    # otherwise flag book_gone. Do not count a 404 as an API fault.
+                    await self._on_holding_book_gone(pos, marks)
+                    continue
+                self._note_book_exc(exc, "holding_book")
                 continue
             row = self.repo.latest_approved_decision(pos.token_id)
             entry_p, entry_ts = thesis_from_decision(row)
@@ -581,8 +625,11 @@ class TradingApp:
                 settings=self.settings,
             )
             # 0 is a real mark. `if best_bid` used to keep equity at entry.
+            pos.book_gone = False
             if verdict.mark is not None:
                 marks[pos.token_id] = verdict.mark
+                pos.last_mark = float(verdict.mark)
+                self._last_marks[pos.token_id] = float(verdict.mark)
             if verdict.reason == "stop_loss":
                 await self._exit_stop(pos, verdict, entry_p)
                 continue
@@ -633,12 +680,55 @@ class TradingApp:
                 return str(row["status"])
         return None
 
+    async def _on_holding_book_gone(self, pos, marks: dict[str, float]) -> None:
+        """Book 404. Settle at the Gamma outcome, or keep the ticket and the last mark.
+
+        One HOLDING_BOOK_GONE per position per cycle when Gamma has not pinned
+        a resolution. The next cycle tries settlement again.
+        """
+        if await self._settle_if_resolved(pos):
+            return
+        pos.book_gone = True
+        last = self._last_marks.get(pos.token_id)
+        if last is None and pos.last_mark is not None:
+            last = float(pos.last_mark)
+        if last is None and pos.token_id in marks:
+            last = float(marks[pos.token_id])
+        mark_txt = "none"
+        if last is not None:
+            last = float(last)
+            pos.last_mark = last
+            self._last_marks[pos.token_id] = last
+            marks[pos.token_id] = last
+            mark_txt = f"{last:.6f}"
+        self.log.warning(
+            "HOLDING_BOOK_GONE token=%s market=%s last_mark=%s",
+            pos.token_id[:16],
+            pos.market_id,
+            mark_txt,
+        )
+        self.repo.event(
+            "HOLDING_BOOK_GONE",
+            f"token={pos.token_id} market={pos.market_id} last_mark={mark_txt}",
+            {
+                "token_id": pos.token_id,
+                "market_id": pos.market_id,
+                "book_gone": True,
+                "last_mark": last,
+                "shares": pos.shares,
+                "avg_price": pos.avg_price,
+            },
+        )
+
     async def _settle_if_resolved(self, pos) -> bool:
         try:
             market = await self.data.get_market(pos.market_id)
         except Exception as exc:
-            # Do not count this toward the API kill. The book stop still runs.
+            # A missing market is not a fault. Timeouts, 5xx, 429, and network
+            # errors are. The book path still runs after this returns False.
             self.repo.event("API_ERROR", f"holding_market:{exc}")
+            if is_api_fault(exc):
+                self.risk.note_api_failure()
             return False
         if market is None:
             return False
@@ -860,8 +950,8 @@ class TradingApp:
         try:
             yes_book, no_book = await self._books(m)
         except Exception as exc:
-            self.risk.note_api_failure()
-            self.repo.event("API_ERROR", str(exc))
+            # 404 on a candidate is a dead market, not repeated_api_failures.
+            self._note_book_exc(exc, "screen_book")
             return False
         self._mark_books(m, yes_book, no_book, marks)
         book_reject = filter_book(yes_book, self.settings)
@@ -1004,8 +1094,7 @@ class TradingApp:
         try:
             yes_book, no_book = await self._books(m)
         except Exception as exc:
-            self.risk.note_api_failure()
-            self.repo.event("API_ERROR", str(exc))
+            self._note_book_exc(exc, "screen_book")
             return True
         self._mark_books(m, yes_book, no_book, marks)
         exp = exposure_from_positions(positions, marks)

@@ -10,6 +10,64 @@ from typing import Any, AsyncIterator
 from app.market_data.models import Market, OrderBook, utcnow
 from app.market_data.orderbook import book_from_raw
 
+# Bounds a hung CLOB or Gamma call so one position cannot freeze the cycle.
+# Timeouts are API faults. A 404 is not: the book was removed.
+HTTP_TIMEOUT_S = 20.0
+
+
+class BookNotFound(Exception):
+    """CLOB has no order book for this token (HTTP 404 / market removed)."""
+
+    def __init__(self, token_id: str = "") -> None:
+        self.token_id = token_id
+        super().__init__(f"order book not found: {token_id}")
+
+
+def status_code_of(exc: BaseException) -> int | None:
+    for attr in ("status_code", "status", "code"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, int) and 100 <= val <= 599:
+            return val
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        val = getattr(resp, "status_code", None)
+        if isinstance(val, int) and 100 <= val <= 599:
+            return val
+    return None
+
+
+def is_not_found(exc: BaseException) -> bool:
+    """True when the book or market is gone, not when the API is sick."""
+    if isinstance(exc, BookNotFound):
+        return True
+    if status_code_of(exc) == 404:
+        return True
+    msg = str(exc).lower()
+    return "404" in msg and "not found" in msg
+
+
+def is_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    return "timeout" in type(exc).__name__.lower()
+
+
+def is_api_fault(exc: BaseException) -> bool:
+    """5xx, 429, timeout, or a transport error. 404 is not a fault."""
+    if is_not_found(exc):
+        return False
+    if is_timeout(exc):
+        return True
+    status = status_code_of(exc)
+    if status == 429 or (status is not None and status >= 500):
+        return True
+    if status is not None:
+        return False
+    name = type(exc).__name__.lower()
+    if any(tok in name for tok in ("connect", "network", "protocol", "readerror", "writeerror", "proxy")):
+        return True
+    return isinstance(exc, OSError)
+
 
 def _get(obj: Any, *names: str, default: Any = None) -> Any:
     if obj is None:
@@ -221,10 +279,18 @@ def _book_levels(obj: Any, key: str) -> list[dict]:
 class PolymarketClient:
     """Public data only. Paper-safe."""
 
-    def __init__(self, gamma_url: str, clob_url: str, ws_url: str) -> None:
+    def __init__(
+        self,
+        gamma_url: str,
+        clob_url: str,
+        ws_url: str,
+        *,
+        timeout_s: float = HTTP_TIMEOUT_S,
+    ) -> None:
         self.gamma_url = gamma_url.rstrip("/")
         self.clob_url = clob_url.rstrip("/")
         self.ws_url = ws_url
+        self.timeout_s = timeout_s
         self._sdk = None
 
     async def _public(self):
@@ -251,7 +317,7 @@ class PolymarketClient:
         page_size = min(max(limit, 1), 100)
         out: list[Market] = []
         offset = 0
-        async with httpx.AsyncClient(timeout=20.0) as http:
+        async with httpx.AsyncClient(timeout=self.timeout_s) as http:
             while len(out) < limit:
                 params = {
                     "closed": str(closed).lower(),
@@ -300,7 +366,7 @@ class PolymarketClient:
         out: list[Market] = []
         seen: set[str] = set()
         page_size = 50
-        async with httpx.AsyncClient(timeout=30.0) as http:
+        async with httpx.AsyncClient(timeout=self.timeout_s) as http:
             for tag_slug in tags:
                 offset = 0
                 got = 0
@@ -364,12 +430,22 @@ class PolymarketClient:
         return picked[:limit]
 
     async def get_market(self, market_id: str) -> Market | None:
-        """One Gamma market, including closed rows the open-market scanner skips."""
-        import httpx
+        """One Gamma market, including closed rows the open-market scanner skips.
 
+        A hung Gamma call raises TimeoutError. Callers treat that as an API fault.
+        HTTP 404 returns None (the market id is gone), which is not a fault.
+        """
         if not market_id:
             return None
-        async with httpx.AsyncClient(timeout=20.0) as http:
+        try:
+            return await asyncio.wait_for(self._get_market(market_id), timeout=self.timeout_s)
+        except TimeoutError:
+            raise
+
+    async def _get_market(self, market_id: str) -> Market | None:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=self.timeout_s) as http:
             r = await http.get(f"{self.gamma_url}/markets/{market_id}")
             if r.status_code == 404:
                 r = await http.get(
@@ -389,12 +465,34 @@ class PolymarketClient:
         return market_from_sdk(data)
 
     async def get_order_book(self, token_id: str, market_id: str = "") -> OrderBook:
+        """Fetch one book. 404 raises BookNotFound. A hang raises TimeoutError.
+
+        SDK failures other than not-found and timeout fall through to REST.
+        A timeout does not start a second request. That would double the freeze.
+        """
         try:
-            client = await self._public()
-            book = await client.get_order_book(token_id)
-            return self._sdk_book(book, token_id, market_id)
-        except Exception:
+            client = await asyncio.wait_for(self._public(), timeout=self.timeout_s)
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            if is_not_found(exc):
+                raise BookNotFound(token_id) from exc
+            if is_timeout(exc):
+                raise
             return await self._book_http(token_id, market_id)
+        try:
+            book = await asyncio.wait_for(
+                client.get_order_book(token_id), timeout=self.timeout_s
+            )
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            if is_not_found(exc):
+                raise BookNotFound(token_id) from exc
+            if is_timeout(exc):
+                raise
+            return await self._book_http(token_id, market_id)
+        return self._sdk_book(book, token_id, market_id)
 
     def _sdk_book(self, book: Any, token_id: str, market_id: str) -> OrderBook:
         tick = float(_get(book, "tick_size", "tickSize", default=0.01) or 0.01)
@@ -416,8 +514,10 @@ class PolymarketClient:
     async def _book_http(self, token_id: str, market_id: str) -> OrderBook:
         import httpx
 
-        async with httpx.AsyncClient(timeout=20.0) as http:
+        async with httpx.AsyncClient(timeout=self.timeout_s) as http:
             r = await http.get(f"{self.clob_url}/book", params={"token_id": token_id})
+            if r.status_code == 404:
+                raise BookNotFound(token_id)
             r.raise_for_status()
             data = r.json()
         tick = float(data.get("tick_size") or 0.01)

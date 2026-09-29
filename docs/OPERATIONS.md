@@ -37,7 +37,7 @@ Canary caps: $5/order, $20/day, 3 open positions. Autonomous inside those caps.
 ## Kill
 
 `python -m app.cli kill` persists HALTED, blocks new orders, attempts live cancels if live was on.
-`resume-paper` returns to paper only. It does **not** reset the weekly equity baseline or the day-scoped AI burn / realized-loss counters.
+`resume-paper` returns to paper only. It does **not** reset the weekly equity baseline or the day-scoped AI burn / realized-loss counters. There is no env var that clears a halt. A halted loop logs `HALTED reason=... since=...` every cycle until that command. A CLOB 404 on a dead book does not count toward `repeated_api_failures`. See `docs/OPS_HALT.md`.
 
 ## $5,000 paper cohort (env handoff)
 

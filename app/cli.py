@@ -64,6 +64,28 @@ def cmd_opportunities(app: TradingApp) -> int:
 
 
 
+def _snapshot_marks(raw: str | None) -> dict[str, float]:
+    """Last marks persisted on the portfolio snapshot. Empty when none were stored."""
+    import json
+
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    marks = payload.get("marks") if isinstance(payload, dict) else None
+    if not isinstance(marks, dict):
+        return {}
+    out: dict[str, float] = {}
+    for key, val in marks.items():
+        try:
+            out[str(key)] = float(val)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 async def cmd_open_marks(app: TradingApp) -> int:
     """Live mids for open DB positions — for console Mark/equity poll."""
     import json
@@ -71,6 +93,7 @@ async def cmd_open_marks(app: TradingApp) -> int:
     from types import SimpleNamespace
 
     from app.main import _instrument_label
+    from app.market_data.client import is_not_found
 
     rows = app.repo.positions()
     snaps = app.db.query(
@@ -81,9 +104,11 @@ async def cmd_open_marks(app: TradingApp) -> int:
         keys = set(row.keys())
         cash = float(row["cash"] if "cash" in keys else row["cash_usd"] if "cash_usd" in keys else app.settings.paper_starting_bankroll)
         reserved = float(row["reserved_cash"] if "reserved_cash" in keys and row["reserved_cash"] is not None else (row["reserved"] if "reserved" in keys and row["reserved"] is not None else 0))
+        saved_marks = _snapshot_marks(row["extra_json"] if "extra_json" in keys else None)
     else:
         cash = float(app.settings.paper_starting_bankroll)
         reserved = 0.0
+        saved_marks = {}
 
     out = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -101,6 +126,7 @@ async def cmd_open_marks(app: TradingApp) -> int:
             continue
         entry = float(r["avg_price"])
         mid = bid = ask = None
+        book_gone = False
         try:
             book = await app.data.get_order_book(token_id, market_id)
             bid = book.best_bid
@@ -111,8 +137,17 @@ async def cmd_open_marks(app: TradingApp) -> int:
             if mid is None:
                 mid = ask or bid or entry
         except Exception as exc:
-            mid = entry
-            out.setdefault("errors", []).append({"token_id": token_id, "error": str(exc)})
+            book_gone = is_not_found(exc)
+            # Missing book: keep the last stored mark. Entry is only the cost
+            # basis, used when this process has never marked the ticket.
+            mid = saved_marks.get(token_id, entry)
+            out.setdefault("errors", []).append(
+                {
+                    "token_id": token_id,
+                    "error": str(exc),
+                    "kind": "book_gone" if book_gone else "api_fault",
+                }
+            )
         mark = float(mid)
         inv += shares * mark
         mq = app.db.query_one(
@@ -135,6 +170,7 @@ async def cmd_open_marks(app: TradingApp) -> int:
                 "ask": ask,
                 "unrealized": (mark - entry) * shares,
                 "notional": shares * mark,
+                "book_gone": book_gone,
             }
         )
     out["inventory"] = inv
