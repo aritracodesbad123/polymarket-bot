@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import datetime, timezone
 
 from app.ai.probability_engine import InvalidEstimate, ProbabilityEngine
@@ -20,7 +21,7 @@ from app.broker.live import LiveBroker
 from app.broker.paper import PaperBroker
 from app.config import Settings
 from app.evaluation.reports import daily_report
-from app.execution.executor import Executor, idempotency_key
+from app.execution.executor import Executor, exit_attempt_key, idempotency_key
 from app.market_data.client import PolymarketClient
 from app.market_data.scanner import (
     MID_OUTSIDE_BAND,
@@ -46,7 +47,12 @@ from app.risk.regime import (
 from app.storage.db import Database, DatabaseError
 from app.storage.repositories import Repositories
 from app.strategy.evaluator import Decision, StrategyEvaluator
-from app.strategy.holding_review import diagnose_holding, thesis_from_decision
+from app.strategy.holding_review import (
+    diagnose_holding,
+    market_outcome_label,
+    resolution_price,
+    thesis_from_decision,
+)
 
 BANNER_PAPER = """
 ========================================
@@ -544,10 +550,17 @@ class TradingApp:
         return kw
 
     async def _review_holdings(self, marks: dict[str, float]) -> None:
-        """Diagnose open tickets; paper-SELL when thesis/stop/time says exit."""
+        """Diagnose open tickets; paper-SELL when thesis/stop/time says exit.
+
+        A stop is fail-closed: the entry book filter and a previous rejected
+        sell must not leave the ticket open. Resolved markets settle here so
+        they drop out of the live book even when the CLOB is empty.
+        """
         positions = list(self.paper._positions.values())
         for pos in positions:
             if pos.shares <= 1e-12:
+                continue
+            if await self._settle_if_resolved(pos):
                 continue
             try:
                 book = await self.data.get_order_book(pos.token_id, pos.market_id)
@@ -555,10 +568,6 @@ class TradingApp:
                 self.risk.note_api_failure()
                 self.repo.event("API_ERROR", f"holding_book:{exc}")
                 continue
-            if book.best_bid:
-                marks[pos.token_id] = book.best_bid
-            elif book.midpoint:
-                marks[pos.token_id] = book.midpoint
             row = self.repo.latest_approved_decision(pos.token_id)
             entry_p, entry_ts = thesis_from_decision(row)
             verdict = diagnose_holding(
@@ -571,6 +580,12 @@ class TradingApp:
                 entry_ts=entry_ts,
                 settings=self.settings,
             )
+            # 0 is a real mark. `if best_bid` used to keep equity at entry.
+            if verdict.mark is not None:
+                marks[pos.token_id] = verdict.mark
+            if verdict.reason == "stop_loss":
+                await self._exit_stop(pos, verdict, entry_p)
+                continue
             if verdict.reason == "ok":
                 continue
             stale = filter_book(book, self.settings)
@@ -593,61 +608,251 @@ class TradingApp:
             )
             if self.repo.get_decision_by_idempotency(exit_key) or self.repo.get_order_by_idempotency(exit_key):
                 continue
-            decision = Decision(
-                approved=True,
-                reject_reason=None,
-                gates=[],
-                market_id=pos.market_id,
-                token_id=pos.token_id,
-                side="SELL",
-                grok_p=entry_p,
-                market_price=limit,
-                size_shares=pos.shares,
-                size_usd=pos.shares * limit,
-                limit_price=limit,
-                category=pos.category,
-                correlation_group=pos.correlation_group,
-            )
-            did = self.repo.insert_decision(
-                {
-                    "market_id": pos.market_id,
-                    "token_id": pos.token_id,
-                    "side": "SELL",
-                    "approved": True,
-                    "reject_reason": None,
-                    "gates": {"exit_reason": {"passed": True, "detail": verdict.reason}},
-                    "grok_p": entry_p,
-                    "market_price": limit,
-                    "raw_edge": verdict.edge_now,
-                    "size_usd": decision.size_usd,
-                    "size_shares": decision.size_shares,
-                    "strategy_version": self.settings.strategy_version,
-                    "prompt_version": self.settings.prompt_version,
-                    "idempotency_key": exit_key,
-                }
-            )
-            before_pnl = self.paper.realized_pnl
-            err = await self.executor.execute(decision, did, kind="exit")
+            err = await self._submit_holding_exit(pos, verdict, entry_p, limit, exit_key)
             if err:
-                self.repo.event("HOLDING_EXIT_FAIL", f"{verdict.reason}|{err}")
-                continue
-            delta = self.paper.realized_pnl - before_pnl
-            self.risk.note_realized_pnl(delta)
-            if delta >= 0:
-                self.risk.note_win()
-            else:
-                self.risk.note_loss()
-            self.log.info(
-                "HOLDING_EXIT reason=%s token=%s pnl=%.4f",
-                verdict.reason,
-                pos.token_id[:16],
-                delta,
+                self._log_exit_fail(pos, verdict, err)
+
+    def _stop_payload(self, pos, verdict, **extra) -> dict:
+        payload = {
+            "reason": verdict.reason,
+            "detail": verdict.detail,
+            "mark_source": verdict.mark_source,
+            "mark": verdict.mark,
+            "unreal_pct": verdict.unreal_pct,
+            "token_id": pos.token_id,
+            "market_id": pos.market_id,
+            "shares": pos.shares,
+            "avg_price": pos.avg_price,
+        }
+        payload.update(extra)
+        return payload
+
+    def _open_sell_status(self, token_id: str) -> str | None:
+        for row in self.repo.open_orders():
+            if row["token_id"] == token_id and (row["side"] or "").upper() == "SELL":
+                return str(row["status"])
+        return None
+
+    async def _settle_if_resolved(self, pos) -> bool:
+        try:
+            market = await self.data.get_market(pos.market_id)
+        except Exception as exc:
+            # Do not count this toward the API kill. The book stop still runs.
+            self.repo.event("API_ERROR", f"holding_market:{exc}")
+            return False
+        if market is None:
+            return False
+        px = resolution_price(market, pos.token_id)
+        if px is None:
+            return False
+        settled = self.paper.settle(pos.token_id, px)
+        if settled is None:
+            return False
+        shares, pnl = settled
+        outcome = market_outcome_label(market, pos.token_id, px)
+        exit_key = exit_attempt_key(
+            pos.market_id, pos.token_id, self.settings.strategy_version
+        )
+        did = self.repo.insert_decision(
+            {
+                "market_id": pos.market_id,
+                "token_id": pos.token_id,
+                "side": "SELL",
+                "approved": True,
+                "reject_reason": None,
+                "gates": {
+                    "exit_reason": {"passed": True, "detail": "resolved"},
+                    "mark": {"source": "resolution", "value": px},
+                },
+                "market_price": px,
+                "size_usd": shares * px,
+                "size_shares": shares,
+                "strategy_version": self.settings.strategy_version,
+                "prompt_version": self.settings.prompt_version,
+                "idempotency_key": exit_key,
+            }
+        )
+        oid = self.repo.insert_order(
+            {
+                "client_order_id": str(uuid.uuid4()),
+                "idempotency_key": exit_key,
+                "broker": "paper",
+                "market_id": pos.market_id,
+                "token_id": pos.token_id,
+                "side": "SELL",
+                "price": px,
+                "size_shares": shares,
+                "status": "FILLED",
+                "decision_id": did,
+            }
+        )
+        self.repo.insert_fill(
+            {
+                "order_id": oid,
+                "token_id": pos.token_id,
+                "side": "SELL",
+                "shares": shares,
+                "price": px,
+                "fee": 0,
+            }
+        )
+        self.repo.insert_resolved(pos.market_id, outcome, None, None)
+        self.risk.note_realized_pnl(pnl)
+        if pnl >= 0:
+            self.risk.note_win()
+        else:
+            self.risk.note_loss()
+        self.log.info(
+            "HOLDING_SETTLE mark_source=resolution mark=%.6f token=%s pnl=%.4f outcome=%s",
+            px,
+            pos.token_id[:16],
+            pnl,
+            outcome,
+        )
+        self.repo.event(
+            "HOLDING_SETTLE",
+            f"mark_source=resolution mark={px:.6f} pnl={pnl:.4f} outcome={outcome}",
+            {
+                "reason": "resolved",
+                "mark_source": "resolution",
+                "mark": px,
+                "pnl": pnl,
+                "shares": shares,
+                "outcome": outcome,
+                "token_id": pos.token_id,
+                "market_id": pos.market_id,
+            },
+        )
+        return True
+
+    async def _exit_stop(self, pos, verdict, entry_p: float | None) -> None:
+        """Sell a ticket that is already through HOLDING_STOP_PCT.
+
+        Book quality is not a hold. A miss is logged and retried next cycle.
+        """
+        payload = self._stop_payload(pos, verdict)
+        mark_txt = f"{verdict.mark:.6f}" if verdict.mark is not None else "none"
+        pct_txt = (
+            f"{verdict.unreal_pct:.4f}" if verdict.unreal_pct is not None else "none"
+        )
+        self.log.info(
+            "HOLDING_STOP mark_source=%s mark=%s unreal_pct=%s token=%s",
+            verdict.mark_source,
+            mark_txt,
+            pct_txt,
+            pos.token_id[:16],
+        )
+        self.repo.event(
+            "HOLDING_STOP",
+            f"mark_source={verdict.mark_source} mark={mark_txt} unreal_pct={pct_txt}",
+            payload,
+        )
+        inflight = self._open_sell_status(pos.token_id)
+        if inflight:
+            self._log_exit_fail(pos, verdict, f"exit_in_flight:{inflight}")
+            return
+        if verdict.mark_source == "best_bid" and verdict.mark is not None:
+            limit = float(verdict.mark)
+        else:
+            # No bid on the book we just read. Limit 0 takes any bid on the
+            # refetch (a gap through the old price). No bid → no_bid_fill.
+            limit = 0.0
+        exit_key = exit_attempt_key(
+            pos.market_id, pos.token_id, self.settings.strategy_version
+        )
+        err = await self._submit_holding_exit(pos, verdict, entry_p, limit, exit_key)
+        if err:
+            self._log_exit_fail(pos, verdict, err)
+
+    def _log_exit_fail(self, pos, verdict, fail: str) -> None:
+        mark_txt = f"{verdict.mark:.6f}" if verdict.mark is not None else "none"
+        self.log.warning(
+            "HOLDING_EXIT_FAIL reason=%s fail=%s mark_source=%s mark=%s token=%s",
+            verdict.reason,
+            fail,
+            verdict.mark_source,
+            mark_txt,
+            pos.token_id[:16],
+        )
+        self.repo.event(
+            "HOLDING_EXIT_FAIL",
+            f"{verdict.reason}|{fail}|mark_source={verdict.mark_source}|mark={mark_txt}",
+            self._stop_payload(pos, verdict, fail=fail),
+        )
+
+    async def _submit_holding_exit(self, pos, verdict, entry_p, limit: float, exit_key: str) -> str | None:
+        """Submit one exit. Returns an error string, or None when size came off."""
+        shares_before = pos.shares
+        decision = Decision(
+            approved=True,
+            reject_reason=None,
+            gates=[],
+            market_id=pos.market_id,
+            token_id=pos.token_id,
+            side="SELL",
+            grok_p=entry_p,
+            market_price=limit,
+            size_shares=pos.shares,
+            size_usd=pos.shares * limit,
+            limit_price=limit,
+            category=pos.category,
+            correlation_group=pos.correlation_group,
+        )
+        did = self.repo.insert_decision(
+            {
+                "market_id": pos.market_id,
+                "token_id": pos.token_id,
+                "side": "SELL",
+                "approved": True,
+                "reject_reason": None,
+                "gates": {
+                    "exit_reason": {"passed": True, "detail": verdict.reason},
+                    "mark": {"source": verdict.mark_source, "value": verdict.mark},
+                },
+                "grok_p": entry_p,
+                "market_price": limit,
+                "raw_edge": verdict.edge_now,
+                "size_usd": decision.size_usd,
+                "size_shares": decision.size_shares,
+                "strategy_version": self.settings.strategy_version,
+                "prompt_version": self.settings.prompt_version,
+                "idempotency_key": exit_key,
+            }
+        )
+        before_pnl = self.paper.realized_pnl
+        try:
+            err = await self.executor.execute(
+                decision,
+                did,
+                kind="exit",
+                idempotency_key_override=exit_key,
             )
-            self.repo.event(
-                "HOLDING_EXIT",
-                f"{verdict.reason} | pnl={delta:.4f}",
-                {"reason": verdict.reason, "detail": verdict.detail, "pnl": delta},
-            )
+        except Exception as exc:
+            return f"exit_error:{exc}"
+        held = self.paper._positions.get(pos.token_id)
+        left = held.shares if held is not None else 0.0
+        if err or left >= shares_before - 1e-12:
+            return err or "unfilled"
+        delta = self.paper.realized_pnl - before_pnl
+        self.risk.note_realized_pnl(delta)
+        if delta >= 0:
+            self.risk.note_win()
+        else:
+            self.risk.note_loss()
+        self.log.info(
+            "HOLDING_EXIT reason=%s token=%s pnl=%.4f mark_source=%s mark=%s",
+            verdict.reason,
+            pos.token_id[:16],
+            delta,
+            verdict.mark_source,
+            f"{verdict.mark:.6f}" if verdict.mark is not None else "none",
+        )
+        self.repo.event(
+            "HOLDING_EXIT",
+            f"{verdict.reason} | pnl={delta:.4f} | mark_source={verdict.mark_source} mark={verdict.mark}",
+            self._stop_payload(pos, verdict, pnl=delta, shares=shares_before),
+        )
+        return None
 
     async def _consider(self, m, positions, marks: dict[str, float]) -> bool:
         if not m.yes_token_id:

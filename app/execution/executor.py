@@ -26,6 +26,16 @@ from app.strategy.evaluator import Decision
 WINDOW_SECONDS = 6 * 60 * 60
 
 
+def exit_attempt_key(market_id: str, token_id: str, strategy_version: str) -> str:
+    """Fresh key per exit attempt.
+
+    Entry keys stay on the 6-hour window. Reusing that window for a stop sell
+    recorded the failed attempt and then skipped every later cycle in silence.
+    """
+    raw = f"{market_id}|{token_id}|SELL|{strategy_version}|exit|{uuid.uuid4()}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
 def idempotency_key(
     market_id: str,
     token_id: str,
@@ -62,11 +72,18 @@ class Executor:
         return self.paper
 
     async def execute(
-        self, decision: Decision, decision_id: int, *, kind: str = "entry"
+        self,
+        decision: Decision,
+        decision_id: int,
+        *,
+        kind: str = "entry",
+        idempotency_key_override: str | None = None,
     ) -> str | None:
         if not decision.approved or not decision.token_id:
             return "not_approved"
-        key = idempotency_key(
+        # `kind` is overwritten below when the order event is named.
+        is_exit = kind == "exit"
+        key = idempotency_key_override or idempotency_key(
             decision.market_id,
             decision.token_id,
             decision.side or "BUY",
@@ -80,9 +97,12 @@ class Executor:
             return "duplicate_order"
 
         book = await self.data.get_order_book(decision.token_id, decision.market_id)
-        stale = filter_book(book, self.settings)
-        if stale:
-            return stale
+        # Entry spread / both-sides / freshness gates must not block a stop.
+        # A one-sided or wide book is when the stop needs to sell.
+        if not is_exit:
+            stale = filter_book(book, self.settings)
+            if stale:
+                return stale
 
         cid = str(uuid.uuid4())
         req = OrderRequest(
@@ -158,6 +178,8 @@ class Executor:
             self.repo.event(kind, f"{decision.market_id} {rec.filled_shares}@{rec.avg_fill_price}")
         kind = "PAPER_ORDER" if broker.name == "paper" else "LIVE_ORDER"
         self.repo.event(kind, rec.status.value, {"client_order_id": cid})
+        if is_exit and rec.filled_shares <= 1e-12:
+            return rec.message or rec.status.value
         return None
 
     async def _token_commitment(self, broker, token_id: str) -> float | None:

@@ -252,6 +252,21 @@ class PaperBroker:
         self.records[req.client_order_id] = rec
         return rec
 
+    def settle(self, token_id: str, price: float) -> tuple[float, float] | None:
+        """Redeem shares at a resolution price. Not a book fill, so no taker fee."""
+        pos = self._positions.get(token_id)
+        if pos is None or pos.shares <= FLAT_SHARES:
+            return None
+        shares = pos.shares
+        px = float(price)
+        proceeds = shares * px
+        pnl = (px - pos.avg_price) * shares
+        self.cash += proceeds
+        self.realized_pnl += pnl
+        pos.realized_pnl += pnl
+        del self._positions[token_id]
+        return shares, pnl
+
     def _apply_buy(self, req: OrderRequest, shares: float, price: float, decision: Decision) -> None:
         pos = self._positions.get(req.token_id)
         if pos is None:

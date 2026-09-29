@@ -24,6 +24,21 @@ def test_partial_fill_when_thin():
     assert f.unfilled_shares == 90
 
 
+def test_normalize_keeps_zero_and_one():
+    from app.market_data.orderbook import book_from_raw
+
+    zero = book_from_raw("t", [{"price": "0", "size": "25"}], [])
+    assert zero.best_bid == 0.0
+    dust = book_from_raw(
+        "t",
+        [{"price": "0", "size": "25"}, {"price": "0.001", "size": "10"}],
+        [{"price": "1", "size": "4"}],
+    )
+    assert dust.best_bid == 0.001
+    assert [lvl.price for lvl in dust.bids] == [0.001, 0.0]
+    assert dust.best_ask == 1.0
+
+
 def test_empty_book():
     b = OrderBook(token_id="t")
     f = walk_book(b, "BUY", 10)
