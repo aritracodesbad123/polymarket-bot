@@ -7,6 +7,9 @@ __pycache__/
 paper_trade_log.txt
 positions.db
 polygrok.db
+*.db
+*.db-wal
+*.db-shm
 bot.log
 *.log
 paper_bot.pid
