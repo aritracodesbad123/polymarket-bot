@@ -28,3 +28,7 @@ Do **not** `DELETE` the position row and do **not** hand-edit cash. That drops t
 1. Deploy this build and let the paper loop run **one** cycle on `polygrok-week2-5000.db`.
 2. `4761828`: if Gamma has it closed, that cycle settles the loser at the outcome (0 for the YES you held) and the console ticket goes CLOSED. If it is still open and the book is past the stop, that cycle sells. If the book has no bid, you get a fresh `HOLDING_EXIT_FAIL` every cycle until a bid shows up or the market resolves — not silence.
 3. Confirm in `system_events`: `HOLDING_STOP` (or `HOLDING_SETTLE`) with `mark_source` and `mark`, then `HOLDING_EXIT` or `HOLDING_SETTLE`. A ticket that is still OPEN after that cycle must have a new `HOLDING_EXIT_FAIL` from this process. If it does not, the loop is not on this build or the process is HALTED.
+
+## CLOB 404 on a held book
+
+A 404 means the book was removed. It is not an API outage and must not call `note_api_failure`. The cycle asks Gamma again (same settlement as above). A pinned outcome settles. A closed market that is not resolved stays open, flagged `book_gone`, with `HOLDING_BOOK_GONE` once per cycle and the last mark kept. The halt latch and the operator clear are in `docs/OPS_HALT.md`.

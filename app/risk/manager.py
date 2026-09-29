@@ -81,6 +81,12 @@ class RiskManager:
             self.kill.trigger("repeated_api_failures")
 
     def note_api_ok(self) -> None:
+        """Zero the fault streak after any successful API call.
+
+        A scan, a Gamma market read, or an order book (including an empty one)
+        all count. A 404 does not: it is not a fault and it is not a success.
+        This does not clear a halt that has already been written.
+        """
         self._api_failures = 0
 
     def note_stale(self) -> None:
