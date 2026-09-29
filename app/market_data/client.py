@@ -26,6 +26,23 @@ def _get(obj: Any, *names: str, default: Any = None) -> Any:
                 return v
     return default
 
+def _optional_px(value: Any) -> float | None:
+    """Parse a price. Missing stays missing — do not coerce it to 0."""
+    if value is None or value is False:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    return None
+
+
 def _num(*values: Any, default: float = 0.0) -> float:
     """Coerce first usable numeric (handles string Gamma fields)."""
     for v in values:
@@ -346,6 +363,31 @@ class PolymarketClient:
                 seen_ids.add(m.market_id)
         return picked[:limit]
 
+    async def get_market(self, market_id: str) -> Market | None:
+        """One Gamma market, including closed rows the open-market scanner skips."""
+        import httpx
+
+        if not market_id:
+            return None
+        async with httpx.AsyncClient(timeout=20.0) as http:
+            r = await http.get(f"{self.gamma_url}/markets/{market_id}")
+            if r.status_code == 404:
+                r = await http.get(
+                    f"{self.gamma_url}/markets", params={"id": str(market_id)}
+                )
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            data = r.json()
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if isinstance(data, dict) and "question" not in data and data.get("markets"):
+            rows = data.get("markets") or []
+            data = rows[0] if rows else None
+        if not isinstance(data, dict):
+            return None
+        return market_from_sdk(data)
+
     async def get_order_book(self, token_id: str, market_id: str = "") -> OrderBook:
         try:
             client = await self._public()
@@ -368,6 +410,7 @@ class PolymarketClient:
             min_order_size=mos,
             neg_risk=neg,
             book_hash=str(h) if h else None,
+            last_trade_price=_optional_px(_get(book, "last_trade_price", "lastTradePrice")),
         )
 
     async def _book_http(self, token_id: str, market_id: str) -> OrderBook:
@@ -388,6 +431,7 @@ class PolymarketClient:
             min_order_size=mos,
             neg_risk=bool(data.get("neg_risk")),
             book_hash=data.get("hash"),
+            last_trade_price=_optional_px(data.get("last_trade_price")),
         )
 
     async def subscribe_books(self, token_ids: list[str]) -> AsyncIterator[OrderBook]:

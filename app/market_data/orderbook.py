@@ -20,7 +20,9 @@ class FillEstimate:
 
 
 def normalize_levels(levels: list[BookLevel], *, asks: bool) -> list[BookLevel]:
-    cleaned = [lvl for lvl in levels if lvl.size > 0 and 0 < lvl.price < 1]
+    # Keep 0 and 1. A gapped or resolved book prints those; dropping them made
+    # the holding stop see an empty book while the console still showed ~0.
+    cleaned = [lvl for lvl in levels if lvl.size > 0 and 0.0 <= lvl.price <= 1.0]
     if asks:
         return sorted(cleaned, key=lambda x: x.price)
     return sorted(cleaned, key=lambda x: x.price, reverse=True)
@@ -36,6 +38,7 @@ def book_from_raw(
     min_order_size: float = 1.0,
     neg_risk: bool = False,
     book_hash: str | None = None,
+    last_trade_price: float | None = None,
 ) -> OrderBook:
     def lvl(x: dict) -> BookLevel:
         return BookLevel(price=float(x["price"]), size=float(x["size"]))
@@ -49,6 +52,7 @@ def book_from_raw(
         min_order_size=min_order_size,
         neg_risk=neg_risk,
         hash=book_hash,
+        last_trade_price=last_trade_price,
     )
 
 
